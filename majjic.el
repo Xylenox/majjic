@@ -151,6 +151,15 @@ When nil, do not pass a limit to `jj log'."
   (setq-local revert-buffer-function #'majjic--revert-buffer)
   (setq-local truncate-lines t))
 
+(defvar-keymap majjic-snapshot-mode-map
+  :parent special-mode-map
+  "q" #'quit-window)
+
+(define-derived-mode majjic-snapshot-mode special-mode "Majjic-Snapshot"
+  "Major mode for read-only `majjic' snapshot buffers.
+\\<majjic-snapshot-mode-map>\\[quit-window] closes the temporary snapshot window."
+  :group 'majjic)
+
 (define-minor-mode majjic-abandon-mode
   "Minor mode for staging `jj abandon' selections in a `majjic' log buffer."
   :lighter " Abandon"
@@ -1201,6 +1210,7 @@ read-only snapshot."
          window)
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
+        (majjic-snapshot-mode)
         (erase-buffer)
         (insert content)
         (goto-char (point-min))
@@ -1215,8 +1225,7 @@ read-only snapshot."
       (select-window window)
       (with-current-buffer buffer
         (majjic--goto-line-column line column)
-        (set-window-point window (point))
-        (set-window-start window (line-beginning-position) t)))))
+        (set-window-point window (point))))))
 
 (defun majjic--goto-line-column (&optional line column)
   "Move to LINE and COLUMN in the current buffer when provided."
