@@ -1,14 +1,14 @@
-# jjui.el
+# majjic
 
-[jjui](https://github.com/idursun/jjui) + magit in emacs
+Magit-style Emacs UI for Jujutsu.
 
-![jjui demo](./jjui-demo.gif)
+![majjic demo](./majjic-demo.gif)
 
-[Screen recording](./jjui-demo.mov)
+[Screen recording](./majjic-demo.mov)
 
 ## Commands
 
-- `M-x jjui` open the log
+- `M-x majjic` open the log
 - `TAB` expand or collapse a revision, file, or hunk
 - `RET` open a file or jump from a hunk line
 - `n` / `p` move through visible sections
