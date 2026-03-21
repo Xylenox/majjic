@@ -20,8 +20,7 @@
 (require 'cl-lib)
 (require 'magit-section)
 (require 'subr-x)
-(require 'ansi-color)
-(require 'color)
+(require 'majjic-model)
 
 (defgroup majjic nil
   "Minimal UI for Jujutsu."
@@ -53,9 +52,6 @@ When nil, do not pass a limit to `jj log'."
 (defvar-local majjic--repo-root nil
   "Repository root for the current `majjic-log-mode' buffer.")
 
-(defvar-local majjic--last-error nil
-  "Last refresh error shown in the current `majjic-log-mode' buffer.")
-
 (defvar-local majjic--mutation-in-progress nil
   "Non-nil while a mutating Jujutsu command is running in this buffer.")
 
@@ -65,11 +61,12 @@ When nil, do not pass a limit to `jj log'."
 (defvar-local majjic--abandon-overlays nil
   "Overlays used to style revisions selected in abandon mode.")
 
-(defvar-local majjic--records nil
-  "Last parsed log records rendered in the current buffer.")
-
 (defvar-local majjic--selected-hunk-heading-overlays nil
   "Overlays used to emphasize hunk headers in the selected file section.")
+
+(require 'majjic-jj)
+(require 'majjic-render)
+(require 'majjic-actions)
 
 (defface majjic-abandon-included-row
   '((t :inherit shadow :strike-through t))
@@ -220,10 +217,7 @@ section bindings that would otherwise page the buffer."
   (interactive)
   (unless (derived-mode-p 'majjic-log-mode)
     (user-error "Not in a majjic log buffer"))
-    (let ((current-change-id (majjic--current-change-id))
-          (expanded-change-ids (majjic--expanded-change-ids))
-          (expanded-file-keys (majjic--expanded-file-keys)))
-      (majjic--log-refresh-sync current-change-id expanded-change-ids expanded-file-keys)))
+  (majjic--log-refresh-sync (majjic--capture-refresh-state)))
 
 (defun majjic-new ()
   "Create a new child of the current revision and move to `@'."
@@ -467,30 +461,32 @@ Follow Magit's naming style with a repo-specific buffer when possible."
               (file-name-nondirectory (directory-file-name repo-root)))
     "majjic"))
 
-(defun majjic--read-log-records ()
-  "Return parsed revision records for the current buffer's repository."
-  (unless majjic--repo-root
-    (error "Not inside a Jujutsu repository"))
-  (majjic--parse-log-output (apply #'majjic--call-jj majjic--repo-root (majjic--log-args))))
+(defun majjic--capture-refresh-state ()
+  "Capture the current transient UI state before a refresh."
+  (make-majjic-state
+   :current-change-id (majjic--current-change-id)
+   :expanded-change-ids (majjic--expanded-change-ids)
+   :expanded-file-keys (majjic--expanded-file-keys)
+   :abandon-selected-ids majjic--abandon-selected-ids))
 
-(defun majjic--log-refresh-sync (current-change-id expanded-change-ids expanded-file-keys)
-  "Synchronously refresh, preserving CURRENT-CHANGE-ID and expansion state."
+(defun majjic--log-refresh-sync (state)
+  "Synchronously refresh, preserving UI STATE."
   (let ((inhibit-read-only t))
-    (setq majjic--last-error nil)
     (erase-buffer)
     (condition-case err
-        (majjic--render-records (majjic--read-log-records) current-change-id
-                               expanded-change-ids expanded-file-keys)
+        (majjic--render-records (majjic--read-log-records) state)
       (error
        (majjic--render-error (error-message-string err))))))
 
-(defun majjic--render-records (records current-change-id expanded-change-ids expanded-file-keys)
-  "Render RECORDS and restore CURRENT-CHANGE-ID and EXPANDED-CHANGE-IDS."
-  (setq majjic--records records)
+(defun majjic--render-records (records state)
+  "Render RECORDS and restore UI STATE."
+  (setq majjic--abandon-selected-ids (majjic-state-abandon-selected-ids state))
   (if records
       (progn
-        (majjic--insert-records records expanded-change-ids expanded-file-keys)
-        (majjic--goto-change current-change-id)
+        (majjic--insert-records records
+                                (majjic-state-expanded-change-ids state)
+                                (majjic-state-expanded-file-keys state))
+        (majjic--goto-change (majjic-state-current-change-id state))
         (unless (majjic--current-revision-section)
           (goto-char (point-min))
           (when (magit-section-at)
@@ -500,110 +496,7 @@ Follow Magit's naming style with a repo-specific buffer when possible."
 
 (defun majjic--render-error (message)
   "Render error MESSAGE in the current buffer."
-  (setq majjic--records nil)
-  (setq majjic--last-error message)
   (majjic--insert-message message))
-
-(defun majjic--log-args ()
-  "Build arguments for the `jj log' process."
-  (append
-   (list "log" "--color" "always" "--no-pager" "--ignore-working-copy"
-         "--template" (majjic--combined-template))
-   (when majjic-log-revset
-     (list "--revisions" majjic-log-revset))
-   (when majjic-log-limit
-     (list "--limit" (number-to-string majjic-log-limit)))))
-
-(defun majjic--combined-template ()
-  "Build the Jujutsu template used to render one revision record."
-  (concat "\"" majjic--record-separator "\" ++ change_id ++ \""
-          majjic--record-separator "\" ++ commit_id ++ \""
-          majjic--record-separator "\" ++ builtin_log_comfortable"))
-
-(defun majjic--call-jj (dir &rest args)
-  "Run `majjic-program' in DIR with ARGS and return stdout.
-Signal an error if the process exits non-zero or the executable is missing."
-  (unless (executable-find majjic-program)
-    (error "Cannot find `%s' in PATH" majjic-program))
-  (let ((stderr-file (make-temp-file "majjic-jj-stderr-")))
-    (unwind-protect
-        (with-temp-buffer
-          (let ((default-directory dir))
-            (let ((exit-code (apply #'process-file majjic-program nil
-                                    (list (current-buffer) stderr-file) nil args))
-                  (stdout (buffer-string)))
-              (if (zerop exit-code)
-                  stdout
-                (let ((stderr (with-temp-buffer
-                                (insert-file-contents stderr-file)
-                                (buffer-string))))
-                  (error "%s" (string-trim (if (string-blank-p stderr)
-                                               stdout
-                                             stderr))))))))
-      (ignore-errors (delete-file stderr-file)))))
-
-(defun majjic--run-mutation (thunk &rest plist)
-  "Run mutating THUNK with refresh and simple in-flight protection.
-Keyword args:
-:target is a commit id or a function returning one after success.
-:after-success is a function called before refreshing after success."
-  (when majjic--mutation-in-progress
-    (user-error "Another jj mutation is already running"))
-  (unless majjic--repo-root
-    (user-error "Not inside a Jujutsu repository"))
-  (let* ((majjic--mutation-in-progress t)
-         (target-spec (plist-get plist :target))
-         (after-success (plist-get plist :after-success))
-         (current-change-id (majjic--current-change-id))
-         (expanded-change-ids (majjic--expanded-change-ids))
-         (expanded-file-keys (majjic--expanded-file-keys))
-         (target current-change-id))
-    (unwind-protect
-        (condition-case err
-            (progn
-              (funcall thunk)
-              (when after-success
-                (funcall after-success))
-              (setq target (cond
-                            ((functionp target-spec) (funcall target-spec))
-                            (target-spec target-spec)
-                            (t current-change-id)))
-              (majjic--log-refresh-sync target expanded-change-ids expanded-file-keys))
-          (error
-           (message "%s" (error-message-string err))
-           nil))
-      (setq majjic--mutation-in-progress nil))))
-
-(defun majjic--require-current-commit-id ()
-  "Return the current revision commit id, or signal a user error."
-  (or (majjic--current-change-id)
-      (user-error "No revision selected")))
-
-(defun majjic--working-copy-commit-id ()
-  "Return the commit id for `@' in the current repository view."
-  (string-trim
-   (majjic--call-jj majjic--repo-root "log" "-r" "@"
-                   "--ignore-working-copy" "--no-graph"
-                   "--color" "never" "--template" "commit_id")))
-
-(defun majjic--revision-exists-p (commit-id)
-  "Return non-nil if COMMIT-ID exists in the current repo view."
-  (when commit-id
-    (condition-case nil
-        (not (string-empty-p
-              (string-trim
-               (majjic--call-jj majjic--repo-root "log" "-r" commit-id
-                               "--ignore-working-copy" "--no-graph"
-                               "--color" "never" "--template" "commit_id"))))
-      (error nil))))
-
-(defun majjic--selection-fallbacks (commit-id)
-  "Return candidate revisions to select if COMMIT-ID vanishes after mutation."
-  (let ((ids (majjic--revision-commit-ids)))
-    (when-let* ((pos (cl-position commit-id ids :test #'equal)))
-      (delq nil (list (nth (1+ pos) ids)
-                      (nth (1- pos) ids)
-                      (majjic--working-copy-commit-id))))))
 
 (defun majjic--revision-commit-ids ()
   "Return commit ids for visible revision sections in buffer order."
@@ -613,10 +506,6 @@ Keyword args:
         (when (object-of-class-p child 'majjic-revision-section)
           (push (oref child value) ids))))
     (nreverse ids)))
-
-(defun majjic--prefixed-rev-args (commit-ids)
-  "Return `-r' args for COMMIT-IDS."
-  (cl-mapcan (lambda (commit-id) (list "-r" commit-id)) commit-ids))
 
 (defun majjic--abandon-toggle-current ()
   "Toggle current revision in the abandon selection."
@@ -629,10 +518,6 @@ Keyword args:
               (cl-remove commit-id majjic--abandon-selected-ids :test #'equal)
             (cons commit-id majjic--abandon-selected-ids)))
     (majjic--restyle-abandon-revision revision commit-id)))
-
-(defun majjic--refresh-abandon-display ()
-  "Refresh abandon overlays in the current buffer."
-  (majjic--sync-abandon-overlays))
 
 (defun majjic--restyle-abandon-revision (revision commit-id)
   "Update abandon styling overlay for REVISION in place."
@@ -669,357 +554,6 @@ Keyword args:
   (mapc #'delete-overlay majjic--abandon-overlays)
   (setq majjic--abandon-overlays nil))
 
-(defun majjic--revision-heading-text (record)
-  "Return propertized heading text for revision RECORD."
-  (let* ((commit-id (plist-get record :commit-id))
-         (heading (majjic--ansi-colorize (plist-get record :heading))))
-    (ignore commit-id)
-    heading))
-
-(defun majjic--revision-summary-text (record)
-  "Return propertized summary text for revision RECORD."
-  (majjic--ansi-colorize (plist-get record :summary)))
-
-(defun majjic--body-text (string commit-id)
-  "Return propertized body STRING for COMMIT-ID, preserving color."
-  (ignore commit-id)
-  (majjic--ansi-colorize string))
-
-(defconst majjic--summary-status-labels
-  '(("A" . "added")
-    ("C" . "copied")
-    ("D" . "deleted")
-    ("M" . "modified")
-    ("R" . "renamed")
-    ("T" . "typechanged"))
-  "Human-readable labels for `jj diff --summary' status codes.")
-
-(defun majjic--insert-file-heading (string &optional color-source)
-  "Insert file heading STRING with a colorized status marker.
-Render the path itself in the default face so file boundaries stay distinct from
-hunk text, then overlay the diff status indicator after `magit-insert-heading'
-so the color survives section rendering and current-row highlighting.
-When COLOR-SOURCE is non-nil, sample the status color from that string instead
-of STRING.  This is useful when STRING has a widened human-readable status
-label, but the original summary output only colored the short status code."
-  (let* ((colored (majjic--ansi-colorize (or color-source string)))
-         (text (majjic--strip-ansi string))
-         status-beg status-end status-face)
-    (when (> (length text) 0)
-      (put-text-property 0 (length text) 'face 'default text))
-    (when (string-match "\\`[[:space:]│├└┼┤┬╯╮╭╰─]*\\(\\S-+\\)\\([[:space:]]+\\)" text)
-      (setq status-beg (match-beginning 1))
-      (setq status-end (match-end 1))
-      (setq status-face (or (get-text-property status-beg 'face colored)
-                            (get-text-property status-beg 'font-lock-face colored))))
-    (let ((heading-start (point)))
-      (magit-insert-heading text)
-      (when status-face
-        (let ((overlay (make-overlay (+ heading-start status-beg)
-                                     (+ heading-start status-end))))
-          (overlay-put overlay 'face (majjic--status-marker-face status-face))
-          (overlay-put overlay 'priority 1002)
-          (overlay-put overlay 'evaporate t))))))
-
-(defun majjic--status-marker-face (face)
-  "Return FACE with bold weight for summary status markers."
-  (if (listp face)
-      (append face '(:weight bold))
-    (list :inherit face :weight 'bold)))
-
-(defun majjic--summary-status-label (status)
-  "Return the human-readable label for summary STATUS."
-  (if (stringp status)
-      (or (alist-get status majjic--summary-status-labels nil nil #'string=)
-          (downcase status))
-    ""))
-
-(defun majjic--summary-status-token (line)
-  "Return the summary status token from LINE, or nil if none."
-  (let ((plain (string-trim-left (majjic--strip-ansi line))))
-    (car (split-string plain "[[:space:]]+" t))))
-
-(defun majjic--summary-status-width ()
-  "Return the fixed width for human-readable summary status labels."
-  (apply #'max (mapcar (lambda (pair) (length (cdr pair)))
-                       majjic--summary-status-labels)))
-
-(defun majjic--format-summary-line (line width)
-  "Return summary LINE with a padded human-readable status column of WIDTH.
-Preserve ANSI escapes from the path portion of LINE."
-  (let ((plain (majjic--strip-ansi line)))
-    (if (string-match "\\`\\([[:space:]│├└┼┤┬╯╮╭╰─]*\\)\\(\\S-+\\)\\([[:space:]]+\\)\\(.*\\)\\'" plain)
-        (let* ((prefix (match-string 1 plain))
-               (status (match-string 2 plain))
-               (label (majjic--summary-status-label status))
-               (path (match-string 4 plain)))
-          (format "%s%s %s" prefix (string-pad label width) path))
-      line)))
-
-(defun majjic--apply-hunk-heading-background (start end)
-  "Overlay a darker background on the hunk heading from START to END.
-Use an overlay instead of text properties because Magit section rendering can
-discard appended face properties on the final inserted heading text."
-  (let ((overlay (make-overlay start end)))
-    (overlay-put overlay 'face (majjic--hunk-heading-face))
-    (overlay-put overlay 'priority 1000)
-    (overlay-put overlay 'evaporate t)
-    overlay))
-
-(defun majjic--hunk-heading-face (&optional selected)
-  "Return a theme-relative face for hunk headings.
-Make the background slightly darker than `magit-section-highlight'.  When
-SELECTED is non-nil, add bold weight."
-  (let* ((highlight-bg (face-attribute 'magit-section-highlight :background nil t))
-         (background (when (majjic--usable-color-p highlight-bg)
-                       (condition-case nil
-                           (color-darken-name highlight-bg 8)
-                         (error nil)))))
-    (append (list :inherit 'magit-section-highlight :extend t)
-            (when background
-              (list :background background))
-            (when selected
-              (list :weight 'bold)))))
-
-(defun majjic--usable-color-p (color)
-  "Return non-nil if COLOR is a concrete color string."
-  (and (stringp color)
-       (not (member color '("unspecified" "unspecified-bg" "unspecified-fg")))))
-
-(defun majjic--update-selected-hunk-heading ()
-  "Bold hunk headers according to the currently selected section.
-Revision and summary sections bold all visible hunk headers beneath that
-revision, file sections bold all hunks in that file, and hunk sections bold only
-the current hunk."
-  (dolist (overlay majjic--selected-hunk-heading-overlays)
-    (when (overlayp overlay)
-      (delete-overlay overlay)))
-  (setq majjic--selected-hunk-heading-overlays nil)
-  (dolist (hunk (majjic--selected-hunk-sections))
-    (when (and (markerp (oref hunk start))
-               (markerp (oref hunk content)))
-      (save-excursion
-        (goto-char (oref hunk start))
-        (let ((overlay (make-overlay (line-beginning-position)
-                                     (min (point-max) (1+ (line-end-position))))))
-          (overlay-put overlay 'face (majjic--hunk-heading-face t))
-          (overlay-put overlay 'priority 1001)
-          (overlay-put overlay 'evaporate t)
-          (push overlay majjic--selected-hunk-heading-overlays))))))
-
-(defun majjic--selected-hunk-sections ()
-  "Return hunk sections that should be emphasized for the current selection."
-  (when-let* ((section (magit-current-section)))
-    (cond
-     ((object-of-class-p section 'majjic-hunk-section)
-      (list section))
-     ((object-of-class-p section 'majjic-file-section)
-      (majjic--descendant-hunk-sections section))
-     ((object-of-class-p section 'majjic-summary-section)
-      (majjic--descendant-hunk-sections section))
-     ((object-of-class-p section 'majjic-revision-section)
-      (when-let* ((summary (majjic--summary-child section)))
-        (majjic--descendant-hunk-sections summary))))))
-
-(defun majjic--descendant-hunk-sections (section)
-  "Return all descendant hunk sections beneath SECTION."
-  (let (hunks)
-    (dolist (child (oref section children))
-      (cond
-       ((object-of-class-p child 'majjic-hunk-section)
-        (push child hunks))
-       (t
-        (setq hunks (nconc (nreverse (majjic--descendant-hunk-sections child))
-                           hunks)))))
-    (nreverse hunks)))
-
-(defun majjic--parse-log-output (output)
-  "Parse `jj log --summary' OUTPUT into revision records."
-  (let ((lines (split-string output "\n"))
-        records
-        current
-        expecting-summary)
-    (dolist (line lines)
-      (cond
-       ((majjic--parse-heading-line line)
-        (when current
-          (push (nreverse current) records))
-        (setq current (list (majjic--parse-heading-line line)))
-        (setq expecting-summary t))
-       ((majjic--elided-line-p line)
-        (when current
-          (push (nreverse current) records))
-        (push (list (cons 'elided line)) records)
-        (setq current nil)
-        (setq expecting-summary nil))
-       ((and (not expecting-summary) (majjic--graph-continuation-line-p line))
-        (when current
-          (push (nreverse current) records))
-        (push (list (cons 'graph line)) records)
-        (setq current nil)
-        (setq expecting-summary nil))
-       ((and current expecting-summary)
-        (push (cons 'summary (majjic--normalize-summary-line line)) current)
-        (setq expecting-summary nil))
-       ((and current (not (string-empty-p line)))
-        ;; Ignore any extra lines from the visible log template. File bodies are
-        ;; loaded lazily on expansion instead of being pre-rendered into the
-        ;; buffer.
-        nil)))
-    (when current
-      (push (nreverse current) records))
-    (nreverse (mapcar #'majjic--record-alist-to-plist records))))
-
-(defun majjic--parse-heading-line (line)
-  "If LINE starts a revision record, return an alist entry for it."
-  (let ((regexp (concat "^\\(.*?\\)" (regexp-quote majjic--record-separator)
-                        "\\([^" (regexp-quote majjic--record-separator) "]+\\)"
-                        (regexp-quote majjic--record-separator)
-                        "\\([^" (regexp-quote majjic--record-separator) "]+\\)"
-                        (regexp-quote majjic--record-separator)
-                        "\\(.*\\)$")))
-    (when (string-match regexp line)
-      (let ((prefix (match-string 1 line))
-            (change-id (match-string 2 line))
-            (commit-id (match-string 3 line))
-            (text (match-string 4 line)))
-        (cons 'heading
-              (list :change-id (majjic--strip-ansi change-id)
-                    :commit-id (majjic--strip-ansi commit-id)
-                    :text (concat prefix text)))))))
-
-(defun majjic--record-alist-to-plist (record)
-  "Convert parsed RECORD alist into a plist."
-  (if-let* ((elided (alist-get 'elided record)))
-      (list :kind 'elided :heading elided)
-    (if-let* ((graph (alist-get 'graph record)))
-        (list :kind 'graph :heading graph)
-      (let* ((heading-entry (alist-get 'heading record))
-             (commit-id (plist-get heading-entry :commit-id))
-             (summary (or (alist-get 'summary record) "")))
-        ;; The synthetic root revision has no description line in `jj log', but
-        ;; the trailing newline can otherwise be normalized into our placeholder.
-        (when (and (majjic--root-commit-id-p commit-id)
-                   (string-match-p "(no description set)" summary))
-          (setq summary nil))
-      (list :kind 'revision
-            :change-id (plist-get heading-entry :change-id)
-            :commit-id commit-id
-            :heading (plist-get heading-entry :text)
-            :summary summary)))))
-
-(defun majjic--insert-records (records expanded-change-ids expanded-file-keys)
-  "Insert RECORDS, restoring expanded revisions and files from saved state."
-  (magit-insert-section (majjic-root-section)
-    (dolist (record records)
-      (pcase (plist-get record :kind)
-        ('elided
-         (magit-insert-section (majjic-elided-section)
-           (magit-insert-heading (majjic--ansi-colorize (plist-get record :heading)))))
-        ('graph
-         (magit-insert-section (majjic-graph-line-section)
-           (magit-insert-heading (majjic--ansi-colorize (plist-get record :heading)))))
-        (_
-         (let* ((commit-id (plist-get record :commit-id))
-               (expanded (member commit-id expanded-change-ids)))
-           (magit-insert-section (majjic-revision-section commit-id)
-             (magit-insert-heading (majjic--revision-heading-text record))
-             (when-let* ((summary (plist-get record :summary)))
-               (magit-insert-section (majjic-summary-section commit-id (not expanded))
-                 (magit-insert-heading (majjic--ansi-colorize summary))
-                 (magit-insert-section-body
-                   (majjic--insert-file-summary commit-id expanded-file-keys)))))))))))
-
-(defun majjic--insert-message (message)
-  "Insert MESSAGE as plain buffer contents."
-  (insert message)
-  (unless (bolp)
-    (insert "\n"))
-  (goto-char (point-min)))
-
-(defun majjic--current-revision-section ()
-  "Return the revision section at point, or its revision ancestor."
-  (let ((section (magit-section-at)))
-    (while (and section (not (object-of-class-p section 'majjic-revision-section)))
-      (setq section (oref section parent)))
-    section))
-
-(defun majjic--current-file-section ()
-  "Return the file section at point, or its file ancestor."
-  (let ((section (magit-section-at)))
-    (while (and section (not (object-of-class-p section 'majjic-file-section)))
-      (setq section (oref section parent)))
-    section))
-
-(defun majjic--current-hunk-section ()
-  "Return the hunk section at point, or nil."
-  (let ((section (magit-section-at)))
-    (while (and section (not (object-of-class-p section 'majjic-hunk-section)))
-      (setq section (oref section parent)))
-    section))
-
-(defun majjic--current-change-id ()
-  "Return the current revision's commit id, or nil."
-  (when-let* ((section (majjic--current-revision-section)))
-    (oref section value)))
-
-(defun majjic--summary-child (revision)
-  "Return the summary child section for REVISION."
-  (when revision
-    (seq-find (lambda (child)
-                (object-of-class-p child 'majjic-summary-section))
-              (oref revision children))))
-
-(defun majjic--next-section-from-point ()
-  "Return the next section at or after point, or nil."
-  (let ((pos (point))
-        section)
-    (while (and (< pos (point-max))
-                (not (setq section (magit-section-at pos))))
-      (setq pos (or (next-single-property-change pos 'magit-section nil (point-max))
-                    (point-max))))
-    section))
-
-(defun majjic--previous-section-from-point ()
-  "Return the previous section at or before point, or nil."
-  (let ((pos (min (point) (1- (point-max))))
-        section)
-    (while (and (> pos (point-min))
-                (not (setq section (magit-section-at pos))))
-      (setq pos (or (previous-single-property-change pos 'magit-section nil (point-min))
-                    (point-min))))
-    (or section (magit-section-at pos))))
-
-(defun majjic--auxiliary-top-level-section-p (section)
-  "Return non-nil if SECTION is a top-level row to skip from revision headings."
-  (or (object-of-class-p section 'majjic-summary-section)
-      (object-of-class-p section 'majjic-elided-section)
-      (object-of-class-p section 'majjic-graph-line-section)))
-
-(defun majjic--section-forward-skip-auxiliary ()
-  "Move forward, skipping auxiliary rows unless already on one."
-  (let ((start (point)))
-    (condition-case err
-        (progn
-          (magit-section-forward)
-          (while (majjic--auxiliary-top-level-section-p (magit-section-at))
-            (magit-section-forward)))
-      (user-error
-       (goto-char start)
-       (signal (car err) (cdr err))))))
-
-(defun majjic--section-backward-skip-auxiliary ()
-  "Move backward, skipping auxiliary rows unless already on one."
-  (let ((start (point)))
-    (condition-case err
-        (progn
-          (magit-section-backward)
-          (while (majjic--auxiliary-top-level-section-p (magit-section-at))
-            (magit-section-backward)))
-      (user-error
-       (goto-char start)
-       (signal (car err) (cdr err))))))
-
 (defun majjic--expanded-change-ids ()
   "Return commit ids whose file sections are currently expanded."
   (let (ids)
@@ -1051,219 +585,6 @@ the current hunk."
                                           (equal (oref child value) commit-id)))
                                    (oref magit-root-section children))))
       (magit-section-goto section))))
-
-(defun majjic--elided-line-p (line)
-  "Return non-nil if LINE is Jujutsu's synthetic elided-revisions row."
-  (string-match-p "(elided revisions)" line))
-
-(defun majjic--graph-continuation-line-p (line)
-  "Return non-nil if LINE is a graph-only junction row from `jj log'.
-Preserve merge/elbow rows like \"│ ├─╯\", but drop plain vertical spacer rows
-like \"│\" or \"│ │\" to avoid adding extra blank space between revisions."
-  (let ((plain (string-trim (majjic--strip-ansi line))))
-    (and (not (string-empty-p plain))
-         (not (string-match-p "[[:alnum:]]" plain))
-         (or (string= plain "~")
-             (string-match-p "[├└┼┤┬╯╮╭╰─]" plain)))))
-
-(defun majjic--ansi-colorize (string)
-  "Return STRING with ANSI escapes converted to text properties."
-  (let ((colored (ansi-color-apply string))
-        (pos 0)
-        (has-face nil))
-    (while (< pos (length colored))
-      (let* ((next (next-single-property-change pos 'font-lock-face colored
-                                                (length colored)))
-             (font-lock-face (get-text-property pos 'font-lock-face colored)))
-        (when font-lock-face
-          (setq has-face t)
-          (put-text-property pos next 'face font-lock-face colored))
-        (setq pos next)))
-    ;; If there was no ANSI color, force a non-nil face so Magit doesn't apply
-    ;; `magit-section-heading' to the whole line.
-    (unless has-face
-      (put-text-property 0 (length colored) 'face 'default colored))
-    colored))
-
-(defun majjic--strip-ansi (string)
-  "Return STRING with ANSI escape sequences removed."
-  (with-temp-buffer
-    (insert string)
-    (ansi-color-filter-region (point-min) (point-max))
-    (buffer-string)))
-
-(defun majjic--insert-file-summary (commit-id expanded-file-keys)
-  "Insert a lazily loaded file summary for COMMIT-ID.
-Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
-  (let* ((prefix (majjic--file-summary-prefix))
-         (output (string-trim-right
-                  (majjic--call-jj majjic--repo-root "diff" "--summary"
-                                  "--color" "always" "-r" commit-id)))
-         (lines (unless (string-empty-p output)
-                  (split-string output "\n")))
-         (status-width (majjic--summary-status-width)))
-    (if (string-empty-p output)
-        (insert (majjic--body-text (concat prefix "(no files changed)") commit-id) "\n")
-      (dolist (line lines)
-        (let ((heading-line (concat prefix (majjic--format-summary-line line status-width)))
-              (color-source (concat prefix line)))
-        (if (majjic--rename-summary-line-p line)
-            (magit-insert-section (majjic-rename-section nil nil :commit-id commit-id)
-              (majjic--insert-file-heading heading-line color-source))
-          (let* ((path (majjic--summary-line-path line))
-                 (expanded (member (cons commit-id path) expanded-file-keys)))
-            (magit-insert-section (majjic-file-section (cons commit-id path) (not expanded)
-                                                      :commit-id commit-id
-                                                      :path path)
-              (majjic--insert-file-heading heading-line color-source)
-              (magit-insert-section-body
-                (majjic--insert-file-diff commit-id path))))))))))
-
-(defun majjic--insert-file-diff (commit-id path)
-  "Insert hunk sections for PATH in COMMIT-ID."
-  (let* ((prefix (majjic--file-summary-prefix))
-         (output (string-trim-right
-                  (majjic--call-jj majjic--repo-root "diff" "--git"
-                                  "--color" "always" "-r" commit-id "--" path)))
-         (lines (if (string-empty-p output) nil (split-string output "\n")))
-         (hunk-header nil)
-         (hunk-body nil)
-         (saw-hunk nil)
-         (hunk-index 0))
-    (cl-labels ((flush-hunk ()
-                           (when hunk-header
-                             (let ((body-lines (nreverse hunk-body)))
-                               (pcase-let* ((`(,old-start ,old-count ,new-start ,new-count)
-                                            (or (majjic--parse-hunk-header hunk-header)
-                                                (list nil nil nil nil))))
-                                 (setq saw-hunk t)
-                                 ;; Give each hunk a unique value so Magit can
-                                 ;; track nested visibility independently.
-                                 (magit-insert-section (majjic-hunk-section hunk-index nil
-                                                                           :old-start old-start
-                                                                           :old-count old-count
-                                                                           :new-start new-start
-                                                                           :new-count new-count
-                                   :body-prefix prefix
-                                   :body-lines body-lines)
-                                   (let ((heading-start (point)))
-                                     (magit-insert-heading
-                                      (majjic--body-text (concat prefix hunk-header) commit-id))
-                                     (majjic--apply-hunk-heading-background
-                                      heading-start (point)))
-                                   (magit-insert-section-body
-                                     (majjic--insert-hunk-body-lines prefix body-lines commit-id)))
-                                 (setq hunk-index (1+ hunk-index))
-                                 (setq hunk-header nil)
-                                 (setq hunk-body nil))))))
-      (dolist (line lines)
-        (if (majjic--hunk-header-line-p line)
-            (progn
-              (flush-hunk)
-              (setq hunk-header line))
-          (when hunk-header
-            (push line hunk-body))))
-      (flush-hunk)
-      (unless saw-hunk
-        (insert (majjic--body-text (concat prefix "(no diff)") commit-id) "\n")))))
-
-(defun majjic--insert-hunk-body-lines (prefix body-lines commit-id)
-  "Insert BODY-LINES for a hunk using PREFIX and preserve color.
-Apply abandon styling for COMMIT-ID when relevant."
-  (dolist (body-line body-lines)
-    (insert (majjic--body-text (concat prefix body-line) commit-id) "\n")))
-
-(defun majjic--prepare-missing-hunk-body (hunk)
-  "If HUNK lost its body text while hidden, regenerate it on the next show.
-`magit-insert-section-body' only installs a washer for sections that start out
-hidden.  Our hunks start expanded, so if a hidden hunk's body disappears after
-an ancestor toggle, restore a one-shot washer right before reopening it."
-  (when (and (= (oref hunk content) (oref hunk end))
-             (null (oref hunk washer))
-             (oref hunk body-lines))
-    (let ((prefix (or (oref hunk body-prefix) ""))
-          (body-lines (oref hunk body-lines))
-          (commit-id (when-let* ((file (oref hunk parent)))
-                       (and (object-of-class-p file 'majjic-file-section)
-                            (oref file commit-id)))))
-      (oset hunk washer
-            (lambda ()
-              (majjic--insert-hunk-body-lines prefix body-lines commit-id))))))
-
-(defun majjic--file-summary-prefix ()
-  "Return the graph gutter prefix to use for lazily loaded file rows."
-  (let* ((summary magit-insert-section--current)
-         (heading (if summary
-                      (buffer-substring-no-properties (oref summary start)
-                                                      (oref summary content))
-                    "")))
-    (if (string-match "\\`\\([^[:alnum:]]*\\)" heading)
-        (majjic--continuation-prefix (match-string 1 heading))
-      "")))
-
-(defun majjic--continuation-prefix (prefix)
-  "Turn graph heading PREFIX into a continuation prefix for child rows.
-Keep vertical bars and spaces, and replace other graph glyphs with spaces so
-files align under the revision while preserving branch columns."
-  (apply #'string
-         (mapcar (lambda (char)
-                   (cond
-                    ((eq char ?│) ?│)
-                    ;; Elbows/tees with a downward segment should continue as a
-                    ;; vertical line through expanded child rows.
-                    ((memq char '(?├ ?┼ ?┤ ?┬ ?┌ ?┐ ?╭ ?╮)) ?│)
-                    ((eq char ?\s) ?\s)
-                    ((eq char ?\t) ?\t)
-                    (t ?\s)))
-                 (string-to-list prefix))))
-
-(defun majjic--normalize-summary-line (line)
-  "Ensure blank summary LINE still shows a placeholder description."
-  (if (string-match-p "[[:alnum:]]" line)
-      line
-    (concat line "(no description set)")))
-
-(defun majjic--root-commit-id-p (commit-id)
-  "Return non-nil if COMMIT-ID is Jujutsu's synthetic root commit."
-  (and (stringp commit-id)
-       (string-match-p "\\`0+\\'" commit-id)))
-
-(defun majjic--summary-line-path (line)
-  "Extract a path from a `jj diff --summary' LINE."
-  (let ((plain (majjic--strip-ansi line)))
-    (if (string-match "\\`[^[:space:]]+[[:space:]]+\\(.+\\)\\'" plain)
-        (majjic--normalize-summary-path (match-string 1 plain))
-      plain)))
-
-(defun majjic--rename-summary-line-p (line)
-  "Return non-nil if summary LINE is a rename row.
-Rename summaries like \"R {old => new}\" are display-only for now because they
-do not expand cleanly to a single path."
-  (let ((plain (majjic--strip-ansi line)))
-    (string-match-p "\\`R[[:space:]]+{.+ => .+}\\'" plain)))
-
-(defun majjic--normalize-summary-path (path)
-  "Return the likely working-tree path from summary PATH text."
-  (if (string-match " -> \\(.+\\)\\'" path)
-      (match-string 1 path)
-    path))
-
-(defun majjic--hunk-header-line-p (line)
-  "Return non-nil if LINE is a unified diff hunk header."
-  (string-prefix-p "@@ " (majjic--strip-ansi line)))
-
-(defun majjic--parse-hunk-header (line)
-  "Parse unified diff hunk header LINE.
-Return a list (OLD-START OLD-COUNT NEW-START NEW-COUNT), or nil if LINE does not
-look like a hunk header."
-  (let ((plain (majjic--strip-ansi line)))
-    (when (string-match
-           "^@@ -\\([0-9]+\\)\\(?:,\\([0-9]+\\)\\)? +\\+\\([0-9]+\\)\\(?:,\\([0-9]+\\)\\)? @@"
-           plain)
-      (list (string-to-number (match-string 1 plain))
-            (string-to-number (or (match-string 2 plain) "1"))
-            (string-to-number (match-string 3 plain))
-            (string-to-number (or (match-string 4 plain) "1"))))))
 
 (defun majjic--hunk-location (hunk)
   "Return (SIDE LINE COLUMN) for HUNK at point.
@@ -1347,44 +668,6 @@ The result is one of `old', `new', `context', `meta', or nil."
       (?\s 'context)
       (?\\ 'meta)
       (_ nil))))
-
-(defun majjic--working-tree-commit-p (commit-id)
-  "Return non-nil if COMMIT-ID should visit the working-tree file."
-  (member commit-id (majjic--working-tree-commit-ids)))
-
-(defun majjic--working-tree-commit-ids ()
-  "Return commit ids that should open files from the working tree."
-  (let* ((current (string-trim
-                   (majjic--call-jj majjic--repo-root "log" "-r" "@"
-                                   "--ignore-working-copy"
-                                   "--no-graph" "--color" "never"
-                                   "--template" "commit_id")))
-         (ids (list current))
-         (current-summary (string-trim
-                           (majjic--call-jj majjic--repo-root "diff" "--summary"
-                                           "--ignore-working-copy"
-                                           "--color" "never" "-r" "@"))))
-    (when (string-empty-p current-summary)
-      (let* ((parents-output (string-trim
-                              (majjic--call-jj majjic--repo-root "log" "-r" "parents(@)"
-                                              "--ignore-working-copy"
-                                              "--no-graph" "--color" "never"
-                                              "--template" "commit_id ++ \"\\n\"")))
-             (parents (seq-remove #'string-empty-p (split-string parents-output "\n"))))
-        (when (= (length parents) 1)
-          (push (car parents) ids))))
-    ids))
-
-(defun majjic--single-parent-commit-id (commit-id)
-  "Return the unique parent commit id of COMMIT-ID, or nil if not unique."
-  (let* ((parents-output (string-trim
-                          (majjic--call-jj majjic--repo-root "log"
-                                          "-r" (format "parents(%s)" commit-id)
-                                          "--no-graph" "--color" "never"
-                                          "--template" "commit_id ++ \"\\n\"")))
-         (parents (seq-remove #'string-empty-p (split-string parents-output "\n"))))
-    (when (= (length parents) 1)
-      (car parents))))
 
 (defun majjic--visit-file-new-side (commit-id path &optional line column)
   "Visit PATH from the new side of COMMIT-ID, optionally at LINE and COLUMN.

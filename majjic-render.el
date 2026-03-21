@@ -1,0 +1,296 @@
+;;; majjic-render.el --- Rendering helpers for Majjic -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026
+
+;; Author: Andy Phan
+;; Package-Requires: ((emacs "28.1") (magit-section "4.5.0"))
+;; Keywords: tools, vc
+
+;;; Commentary:
+
+;; Text and face helpers used when rendering Majjic sections.
+
+;;; Code:
+
+(require 'ansi-color)
+(require 'color)
+(require 'magit-section)
+(require 'majjic-model)
+(require 'subr-x)
+
+(defun majjic--revision-heading-text (record)
+  "Return propertized heading text for revision RECORD."
+  (majjic--ansi-colorize (majjic-revision-heading record)))
+
+(defun majjic--body-text (string)
+  "Return propertized body STRING, preserving color."
+  (majjic--ansi-colorize string))
+
+(defconst majjic--summary-status-labels
+  '(("A" . "added")
+    ("C" . "copied")
+    ("D" . "deleted")
+    ("M" . "modified")
+    ("R" . "renamed")
+    ("T" . "typechanged"))
+  "Human-readable labels for `jj diff --summary' status codes.")
+
+(defun majjic--insert-file-heading (string &optional color-source)
+  "Insert file heading STRING with a colorized status marker."
+  (let* ((colored (majjic--ansi-colorize (or color-source string)))
+         (text (majjic--strip-ansi string))
+         status-beg status-end status-face)
+    (when (> (length text) 0)
+      (put-text-property 0 (length text) 'face 'default text))
+    (when (string-match "\\`[[:space:]│├└┼┤┬╯╮╭╰─]*\\(\\S-+\\)\\([[:space:]]+\\)" text)
+      (setq status-beg (match-beginning 1))
+      (setq status-end (match-end 1))
+      (setq status-face (or (get-text-property status-beg 'face colored)
+                            (get-text-property status-beg 'font-lock-face colored))))
+    (let ((heading-start (point)))
+      (magit-insert-heading text)
+      (when status-face
+        (let ((overlay (make-overlay (+ heading-start status-beg)
+                                     (+ heading-start status-end))))
+          (overlay-put overlay 'face (majjic--status-marker-face status-face))
+          (overlay-put overlay 'priority 1002)
+          (overlay-put overlay 'evaporate t))))))
+
+(defun majjic--status-marker-face (face)
+  "Return FACE with bold weight for summary status markers."
+  (if (listp face)
+      (append face '(:weight bold))
+    (list :inherit face :weight 'bold)))
+
+(defun majjic--summary-status-label (status)
+  "Return the human-readable label for summary STATUS."
+  (if (stringp status)
+      (or (alist-get status majjic--summary-status-labels nil nil #'string=)
+          (downcase status))
+    ""))
+
+(defun majjic--summary-status-width ()
+  "Return the fixed width for human-readable summary status labels."
+  (apply #'max (mapcar (lambda (pair) (length (cdr pair)))
+                       majjic--summary-status-labels)))
+
+(defun majjic--format-summary-line (line width)
+  "Return summary LINE with a padded human-readable status column of WIDTH."
+  (let ((plain (majjic--strip-ansi line)))
+    (if (string-match "\\`\\([[:space:]│├└┼┤┬╯╮╭╰─]*\\)\\(\\S-+\\)\\([[:space:]]+\\)\\(.*\\)\\'" plain)
+        (let* ((prefix (match-string 1 plain))
+               (status (match-string 2 plain))
+               (label (majjic--summary-status-label status))
+               (path (match-string 4 plain)))
+          (format "%s%s %s" prefix (string-pad label width) path))
+      line)))
+
+(defun majjic--apply-hunk-heading-background (start end)
+  "Overlay a darker background on the hunk heading from START to END."
+  (let ((overlay (make-overlay start end)))
+    (overlay-put overlay 'face (majjic--hunk-heading-face))
+    (overlay-put overlay 'priority 1000)
+    (overlay-put overlay 'evaporate t)
+    overlay))
+
+(defun majjic--hunk-heading-face (&optional selected)
+  "Return a theme-relative face for hunk headings."
+  (let* ((highlight-bg (face-attribute 'magit-section-highlight :background nil t))
+         (background (when (majjic--usable-color-p highlight-bg)
+                       (condition-case nil
+                           (color-darken-name highlight-bg 8)
+                         (error nil)))))
+    (append (list :inherit 'magit-section-highlight :extend t)
+            (when background
+              (list :background background))
+            (when selected
+              (list :weight 'bold)))))
+
+(defun majjic--usable-color-p (color)
+  "Return non-nil if COLOR is a concrete color string."
+  (and (stringp color)
+       (not (member color '("unspecified" "unspecified-bg" "unspecified-fg")))))
+
+(defun majjic--ansi-colorize (string)
+  "Return STRING with ANSI escapes converted to text properties."
+  (let ((colored (ansi-color-apply string))
+        (pos 0)
+        (has-face nil))
+    (while (< pos (length colored))
+      (let* ((next (next-single-property-change pos 'font-lock-face colored
+                                                (length colored)))
+             (font-lock-face (get-text-property pos 'font-lock-face colored)))
+        (when font-lock-face
+          (setq has-face t)
+          (put-text-property pos next 'face font-lock-face colored))
+        (setq pos next)))
+    (unless has-face
+      (put-text-property 0 (length colored) 'face 'default colored))
+    colored))
+
+(defun majjic--update-selected-hunk-heading ()
+  "Bold hunk headers according to the currently selected section."
+  (dolist (overlay majjic--selected-hunk-heading-overlays)
+    (when (overlayp overlay)
+      (delete-overlay overlay)))
+  (setq majjic--selected-hunk-heading-overlays nil)
+  (dolist (hunk (majjic--selected-hunk-sections))
+    (when (and (markerp (oref hunk start))
+               (markerp (oref hunk content)))
+      (save-excursion
+        (goto-char (oref hunk start))
+        (let ((overlay (make-overlay (line-beginning-position)
+                                     (min (point-max) (1+ (line-end-position))))))
+          (overlay-put overlay 'face (majjic--hunk-heading-face t))
+          (overlay-put overlay 'priority 1001)
+          (overlay-put overlay 'evaporate t)
+          (push overlay majjic--selected-hunk-heading-overlays))))))
+
+(defun majjic--selected-hunk-sections ()
+  "Return hunk sections that should be emphasized for the current selection."
+  (when-let* ((section (magit-current-section)))
+    (cond
+     ((object-of-class-p section 'majjic-hunk-section)
+      (list section))
+     ((object-of-class-p section 'majjic-file-section)
+      (majjic--descendant-hunk-sections section))
+     ((object-of-class-p section 'majjic-summary-section)
+      (majjic--descendant-hunk-sections section))
+     ((object-of-class-p section 'majjic-revision-section)
+      (when-let* ((summary (majjic--summary-child section)))
+        (majjic--descendant-hunk-sections summary))))))
+
+(defun majjic--descendant-hunk-sections (section)
+  "Return all descendant hunk sections beneath SECTION."
+  (let (hunks)
+    (dolist (child (oref section children))
+      (cond
+       ((object-of-class-p child 'majjic-hunk-section)
+        (push child hunks))
+       (t
+        (setq hunks (nconc (nreverse (majjic--descendant-hunk-sections child))
+                           hunks)))))
+    (nreverse hunks)))
+
+(defun majjic--insert-records (records expanded-change-ids expanded-file-keys)
+  "Insert RECORDS, restoring expanded revisions and files from saved state."
+  (magit-insert-section (majjic-root-section)
+    (dolist (record records)
+      (pcase (majjic-revision-kind record)
+        ('elided
+         (magit-insert-section (majjic-elided-section)
+           (magit-insert-heading (majjic--ansi-colorize (majjic-revision-heading record)))))
+        ('graph
+         (magit-insert-section (majjic-graph-line-section)
+           (magit-insert-heading (majjic--ansi-colorize (majjic-revision-heading record)))))
+        (_
+         (let* ((commit-id (majjic-revision-commit-id record))
+                (expanded (member commit-id expanded-change-ids)))
+           (magit-insert-section (majjic-revision-section commit-id)
+             (magit-insert-heading (majjic--revision-heading-text record))
+             (when-let* ((summary (majjic-revision-summary record)))
+               (magit-insert-section (majjic-summary-section commit-id (not expanded))
+                 (magit-insert-heading (majjic--ansi-colorize summary))
+                 (magit-insert-section-body
+                   (majjic--insert-file-summary commit-id expanded-file-keys)))))))))))
+
+(defun majjic--insert-message (message)
+  "Insert MESSAGE as plain buffer contents."
+  (insert message)
+  (unless (bolp)
+    (insert "\n"))
+  (goto-char (point-min)))
+
+(defun majjic--insert-file-summary (commit-id expanded-file-keys)
+  "Insert a lazily loaded file summary for COMMIT-ID.
+Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
+  (let* ((prefix (majjic--file-summary-prefix))
+         (output (string-trim-right
+                  (majjic--call-jj majjic--repo-root "diff" "--summary"
+                                   "--color" "always" "-r" commit-id)))
+         (file-changes (majjic--parse-file-summary-output output))
+         (status-width (majjic--summary-status-width)))
+    (if (string-empty-p output)
+        (insert (majjic--body-text (concat prefix "(no files changed)")) "\n")
+      (dolist (file-change file-changes)
+        (let* ((raw-line (majjic-file-change-raw-line file-change))
+               (heading-line (concat prefix (majjic--format-summary-line raw-line status-width)))
+               (color-source (concat prefix raw-line)))
+          (if (majjic-file-change-rename file-change)
+              (magit-insert-section (majjic-rename-section nil nil :commit-id commit-id)
+                (majjic--insert-file-heading heading-line color-source))
+            (let* ((path (majjic-file-change-path file-change))
+                   (expanded (member (cons commit-id path) expanded-file-keys)))
+              (magit-insert-section (majjic-file-section (cons commit-id path) (not expanded)
+                                                         :commit-id commit-id
+                                                         :path path)
+                (majjic--insert-file-heading heading-line color-source)
+                (magit-insert-section-body
+                  (majjic--insert-file-diff commit-id path))))))))))
+
+(defun majjic--insert-file-diff (commit-id path)
+  "Insert hunk sections for PATH in COMMIT-ID."
+  (let* ((prefix (majjic--file-summary-prefix))
+         (output (string-trim-right
+                  (majjic--call-jj majjic--repo-root "diff" "--git"
+                                   "--color" "always" "-r" commit-id "--" path)))
+         (hunks (majjic--parse-file-diff-output output)))
+    (if hunks
+        (dolist (hunk hunks)
+          (magit-insert-section (majjic-hunk-section (majjic-hunk-index hunk) nil
+                                                     :old-start (majjic-hunk-old-start hunk)
+                                                     :old-count (majjic-hunk-old-count hunk)
+                                                     :new-start (majjic-hunk-new-start hunk)
+                                                     :new-count (majjic-hunk-new-count hunk)
+                                                     :body-prefix prefix
+                                                     :body-lines (majjic-hunk-body-lines hunk))
+            (let ((heading-start (point)))
+              (magit-insert-heading
+               (majjic--body-text (concat prefix (majjic-hunk-header hunk))))
+              (majjic--apply-hunk-heading-background heading-start (point)))
+            (magit-insert-section-body
+              (majjic--insert-hunk-body-lines prefix (majjic-hunk-body-lines hunk)))))
+      (insert (majjic--body-text (concat prefix "(no diff)")) "\n"))))
+
+(defun majjic--insert-hunk-body-lines (prefix body-lines)
+  "Insert BODY-LINES for a hunk using PREFIX and preserve color."
+  (dolist (body-line body-lines)
+    (insert (majjic--body-text (concat prefix body-line)) "\n")))
+
+(defun majjic--prepare-missing-hunk-body (hunk)
+  "If HUNK lost its body text while hidden, regenerate it on the next show."
+  (when (and (= (oref hunk content) (oref hunk end))
+             (null (oref hunk washer))
+             (oref hunk body-lines))
+    (let ((prefix (or (oref hunk body-prefix) ""))
+          (body-lines (oref hunk body-lines)))
+      (oset hunk washer
+            (lambda ()
+              (majjic--insert-hunk-body-lines prefix body-lines))))))
+
+(defun majjic--file-summary-prefix ()
+  "Return the graph gutter prefix to use for lazily loaded file rows."
+  (let* ((summary magit-insert-section--current)
+         (heading (if summary
+                      (buffer-substring-no-properties (oref summary start)
+                                                      (oref summary content))
+                    "")))
+    (if (string-match "\\`\\([^[:alnum:]]*\\)" heading)
+        (majjic--continuation-prefix (match-string 1 heading))
+      "")))
+
+(defun majjic--continuation-prefix (prefix)
+  "Turn graph heading PREFIX into a continuation prefix for child rows."
+  (apply #'string
+         (mapcar (lambda (char)
+                   (cond
+                    ((eq char ?│) ?│)
+                    ((memq char '(?├ ?┼ ?┤ ?┬ ?┌ ?┐ ?╭ ?╮)) ?│)
+                    ((eq char ?\s) ?\s)
+                    ((eq char ?\t) ?\t)
+                    (t ?\s)))
+                 (string-to-list prefix))))
+
+(provide 'majjic-render)
+
+;;; majjic-render.el ends here
