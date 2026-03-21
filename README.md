@@ -6,19 +6,19 @@
 
 ### Expand Everything!
 
-![Expand Everything!](./media/expand_everything.gif)
+<img src="./media/expand_everything.gif" width="50%" height="50%"/>
 
 ### Open Files!
 
-![Open Files!](./media/open_files.gif)
+<img src="./media/open_files.gif" width="50%" height="50%"/>
 
 ### New and Edit Revisions!
 
-![New and Edit!](./media/new_and_edit.gif)
+<img src="./media/new_and_edit.gif" width="50%" height="50%"/>
 
 ### Abandon!
 
-![Abandon](./media/abandon.gif)
+<img src="./media/abandon.gif" width="50%" height="50%"/>
 
 ## Command Reference
 
