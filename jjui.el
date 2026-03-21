@@ -46,11 +46,6 @@ When nil, do not pass a limit to `jj log'."
                  integer)
   :group 'jjui)
 
-(defcustom jjui-log-async nil
-  "Whether to refresh the log buffer asynchronously."
-  :type 'boolean
-  :group 'jjui)
-
 (defconst jjui--record-separator "\x1f"
   "Separator used to mark revision records in `jj log' output.")
 
@@ -60,28 +55,28 @@ When nil, do not pass a limit to `jj log'."
 (defvar-local jjui--last-error nil
   "Last refresh error shown in the current `jjui-log-mode' buffer.")
 
-(defvar-local jjui--process nil
-  "Current async `jj log' process for this buffer, if any.")
+(defvar-local jjui--mutation-in-progress nil
+  "Non-nil while a mutating Jujutsu command is running in this buffer.")
 
-(defvar-local jjui--pending-output nil
-  "Accumulated stdout/stderr for the current async refresh.")
+(defvar-local jjui--abandon-selected-ids nil
+  "List of commit ids selected in abandon mode.")
 
-(defface jjui-revision-heading
-  '((t :inherit default))
-  "Face for the first visible line of a revision."
-  :group 'jjui)
+(defvar-local jjui--abandon-overlays nil
+  "Overlays used to style revisions selected in abandon mode.")
 
-(defface jjui-revision-summary
-  '((t :inherit default))
-  "Face for the second visible line of a revision."
+(defvar-local jjui--records nil
+  "Last parsed log records rendered in the current buffer.")
+
+(defface jjui-abandon-included-row
+  '((t :inherit shadow :strike-through t))
+  "Face for revisions included in abandon mode."
   :group 'jjui)
 
 (defclass jjui-revision-section (magit-section)
   ((keymap :initform 'jjui-revision-section-map)))
 
 (defclass jjui-summary-section (magit-section)
-  ((keymap :initform 'jjui-summary-section-map)
-   (has-files :initform t :initarg :has-files)))
+  ((keymap :initform 'jjui-summary-section-map)))
 
 (defclass jjui-file-section (magit-section)
   ((keymap :initform 'jjui-file-section-map)
@@ -105,57 +100,50 @@ When nil, do not pass a limit to `jj log'."
 (defclass jjui-graph-line-section (magit-section)
   ((keymap :initform 'jjui-summary-section-map)))
 
-(defvar-keymap jjui-revision-section-map
+(defvar-keymap jjui-section-map
   :parent magit-section-mode-map
   "TAB" #'jjui-toggle-at-point
+  "SPC" #'jjui-space
   "n" #'jjui-section-forward
   "p" #'jjui-section-backward
   "^" #'jjui-section-up
+  "N" #'jjui-new
+  "e" #'jjui-edit
+  "a" #'jjui-abandon-start
   "<wheel-up>" #'jjui-mwheel-scroll
   "<wheel-down>" #'jjui-mwheel-scroll
   "<mouse-4>" #'jjui-mwheel-scroll
   "<mouse-5>" #'jjui-mwheel-scroll
   "g" #'jjui-log-refresh)
+
+(define-key jjui-section-map [32] #'jjui-space)
+
+(defvar-keymap jjui-abandon-mode-map
+  "SPC" #'jjui-abandon-toggle-revision
+  "a" #'jjui-abandon-start
+  "RET" #'jjui-abandon-apply
+  "<return>" #'jjui-abandon-apply
+  "C-g" #'jjui-abandon-cancel)
+
+(define-key jjui-abandon-mode-map " " #'jjui-abandon-toggle-revision)
+(define-key jjui-abandon-mode-map [remap scroll-up-command]
+            #'jjui-abandon-toggle-revision)
+
+(defvar-keymap jjui-revision-section-map
+  :parent jjui-section-map)
 
 (defvar-keymap jjui-summary-section-map
-  :parent magit-section-mode-map
-  "TAB" #'jjui-toggle-at-point
-  "n" #'jjui-section-forward
-  "p" #'jjui-section-backward
-  "^" #'jjui-section-up
-  "<wheel-up>" #'jjui-mwheel-scroll
-  "<wheel-down>" #'jjui-mwheel-scroll
-  "<mouse-4>" #'jjui-mwheel-scroll
-  "<mouse-5>" #'jjui-mwheel-scroll
-  "g" #'jjui-log-refresh)
+  :parent jjui-section-map)
 
 (defvar-keymap jjui-file-section-map
-  :parent magit-section-mode-map
-  "TAB" #'jjui-toggle-at-point
-  "n" #'jjui-section-forward
-  "p" #'jjui-section-backward
-  "^" #'jjui-section-up
-  "<wheel-up>" #'jjui-mwheel-scroll
-  "<wheel-down>" #'jjui-mwheel-scroll
-  "<mouse-4>" #'jjui-mwheel-scroll
-  "<mouse-5>" #'jjui-mwheel-scroll
+  :parent jjui-section-map
   "RET" #'jjui-visit-file
-  "<return>" #'jjui-visit-file
-  "g" #'jjui-log-refresh)
+  "<return>" #'jjui-visit-file)
 
 (defvar-keymap jjui-hunk-section-map
-  :parent magit-section-mode-map
-  "TAB" #'jjui-toggle-at-point
-  "n" #'jjui-section-forward
-  "p" #'jjui-section-backward
-  "^" #'jjui-section-up
-  "<wheel-up>" #'jjui-mwheel-scroll
-  "<wheel-down>" #'jjui-mwheel-scroll
-  "<mouse-4>" #'jjui-mwheel-scroll
-  "<mouse-5>" #'jjui-mwheel-scroll
+  :parent jjui-section-map
   "RET" #'jjui-visit-file
-  "<return>" #'jjui-visit-file
-  "g" #'jjui-log-refresh)
+  "<return>" #'jjui-visit-file)
 
 (define-derived-mode jjui-log-mode magit-section-mode "JJ-Log"
   "Major mode for browsing `jj log' output."
@@ -163,14 +151,38 @@ When nil, do not pass a limit to `jj log'."
   (setq-local revert-buffer-function #'jjui--revert-buffer)
   (setq-local truncate-lines t))
 
+(define-minor-mode jjui-abandon-mode
+  "Minor mode for staging `jj abandon' selections in a `jjui' log buffer."
+  :lighter " Abandon"
+  :keymap jjui-abandon-mode-map
+  (unless (derived-mode-p 'jjui-log-mode)
+    (setq jjui-abandon-mode nil)
+    (user-error "Not in a jjui log buffer"))
+  (unless jjui-abandon-mode
+    (setq jjui--abandon-selected-ids nil)
+    (jjui--clear-abandon-overlays))
+  (force-mode-line-update))
+
 (keymap-set jjui-log-mode-map "n" #'jjui-section-forward)
 (keymap-set jjui-log-mode-map "p" #'jjui-section-backward)
 (keymap-set jjui-log-mode-map "^" #'jjui-section-up)
+(keymap-set jjui-log-mode-map "N" #'jjui-new)
+(keymap-set jjui-log-mode-map "e" #'jjui-edit)
+(keymap-set jjui-log-mode-map "a" #'jjui-abandon-start)
 (keymap-set jjui-log-mode-map "<wheel-up>" #'jjui-mwheel-scroll)
 (keymap-set jjui-log-mode-map "<wheel-down>" #'jjui-mwheel-scroll)
 (keymap-set jjui-log-mode-map "<mouse-4>" #'jjui-mwheel-scroll)
 (keymap-set jjui-log-mode-map "<mouse-5>" #'jjui-mwheel-scroll)
 (keymap-set jjui-log-mode-map "g" #'jjui-log-refresh)
+
+(defun jjui-space ()
+  "In abandon mode toggle the revision at point, otherwise scroll up.
+This is bound on section keymaps so it wins over inherited Magit
+section bindings that would otherwise page the buffer."
+  (interactive)
+  (if jjui-abandon-mode
+      (jjui-abandon-toggle-revision)
+    (call-interactively #'scroll-up-command)))
 
 (defun jjui ()
   "Open a Jujutsu log buffer for the current repository."
@@ -184,36 +196,84 @@ When nil, do not pass a limit to `jj log'."
       (jjui-log-refresh))
     (pop-to-buffer buffer)))
 
-(define-obsolete-function-alias 'jjui-log #'jjui "0.2.0")
-
 (defun jjui-log-refresh ()
   "Refresh the current Jujutsu log buffer."
   (interactive)
   (unless (derived-mode-p 'jjui-log-mode)
     (user-error "Not in a jjui log buffer"))
-  (let ((current-change-id (jjui--current-change-id))
-        (expanded-change-ids (jjui--expanded-change-ids))
-        (expanded-file-keys (jjui--expanded-file-keys)))
-    ;; Temporarily force synchronous refresh while the async path is disabled.
-    (jjui--log-refresh-sync current-change-id expanded-change-ids expanded-file-keys)))
+    (let ((current-change-id (jjui--current-change-id))
+          (expanded-change-ids (jjui--expanded-change-ids))
+          (expanded-file-keys (jjui--expanded-file-keys)))
+      (jjui--log-refresh-sync current-change-id expanded-change-ids expanded-file-keys)))
 
-(defun jjui-next-revision ()
-  "Move point to the next revision section."
+(defun jjui-new ()
+  "Create a new child of the current revision and move to `@'."
   (interactive)
-  (let* ((section (jjui--current-revision-section))
-         (next (and section (jjui--sibling-revision section 'next))))
-    (unless next
-      (user-error "No next revision"))
-    (magit-section-goto next)))
+  (when jjui-abandon-mode
+    (jjui-abandon-disabled-command))
+  (let ((commit-id (jjui--require-current-commit-id)))
+    (jjui--run-mutation
+     (lambda ()
+       (jjui--call-jj jjui--repo-root "new" commit-id))
+     :target #'jjui--working-copy-commit-id)))
 
-(defun jjui-previous-revision ()
-  "Move point to the previous revision section."
+(defun jjui-edit ()
+  "Edit the current revision and move to `@'."
   (interactive)
-  (let* ((section (jjui--current-revision-section))
-         (prev (and section (jjui--sibling-revision section 'prev))))
-    (unless prev
-      (user-error "No previous revision"))
-    (magit-section-goto prev)))
+  (when jjui-abandon-mode
+    (jjui-abandon-disabled-command))
+  (let ((commit-id (jjui--require-current-commit-id)))
+    (jjui--run-mutation
+     (lambda ()
+       (jjui--call-jj jjui--repo-root "edit" "-r" commit-id))
+     :target #'jjui--working-copy-commit-id)))
+
+(defun jjui-abandon-start ()
+  "Enter abandon mode with no revisions selected yet."
+  (interactive)
+  (when jjui-abandon-mode
+    (user-error "Already in abandon mode"))
+  (setq jjui--abandon-selected-ids nil)
+  (jjui-abandon-mode 1)
+  (message "Abandon mode: SPC toggle, RET apply, C-g cancel"))
+
+(defun jjui-abandon-toggle-revision ()
+  "Toggle direct abandon selection for the current revision."
+  (interactive)
+  (jjui--abandon-toggle-current))
+
+(defun jjui-abandon-apply ()
+  "Apply the current abandon selection."
+  (interactive)
+  (unless jjui-abandon-mode
+    (user-error "Not in abandon mode"))
+  (let* ((selected-ids jjui--abandon-selected-ids)
+         (fallbacks (jjui--selection-fallbacks (jjui--current-change-id))))
+    (when (null selected-ids)
+      (user-error "No revisions selected for abandon"))
+    (jjui--run-mutation
+     (lambda ()
+       (apply #'jjui--call-jj jjui--repo-root
+              (append (list "abandon" "--retain-bookmarks")
+                      (jjui--prefixed-rev-args selected-ids))))
+     :after-success (lambda ()
+                      (jjui-abandon-mode -1))
+     :target (lambda ()
+               (or (seq-find #'jjui--revision-exists-p fallbacks)
+                   (jjui--working-copy-commit-id))))))
+
+(defun jjui-abandon-cancel ()
+  "Cancel abandon mode without mutating the repository."
+  (interactive)
+  (unless jjui-abandon-mode
+    (user-error "Not in abandon mode"))
+  (jjui-abandon-mode -1)
+  (message "Abandon canceled"))
+
+(defun jjui-abandon-disabled-command ()
+  "Reject commands that are unavailable while staging abandon selections."
+  (interactive)
+  (user-error "Disabled in abandon mode"))
 
 (defun jjui-section-forward ()
   "Move to the beginning of the next visible section.
@@ -325,13 +385,18 @@ toggle that section's body."
       (when (and (object-of-class-p section 'jjui-hunk-section)
                  (oref section hidden))
         (jjui--prepare-missing-hunk-body section))
-      (magit-section-toggle section))
+      (magit-section-toggle section)
+      (when-let* ((revision (and jjui-abandon-mode (jjui--current-revision-section)))
+                  (commit-id (oref revision value)))
+        (jjui--restyle-abandon-revision revision commit-id)))
      (t
       (let* ((revision (jjui--current-revision-section))
              (summary (jjui--summary-child revision)))
         (unless summary
           (user-error "No section to toggle at point"))
         (magit-section-toggle summary)
+        (when jjui-abandon-mode
+          (jjui--restyle-abandon-revision revision (oref revision value)))
         (magit-section-goto revision))))))
 
 (defun jjui-visit-file ()
@@ -383,7 +448,6 @@ working-tree file.  For older revisions, open a read-only snapshot buffer."
   "Synchronously refresh, preserving CURRENT-CHANGE-ID and expansion state."
   (let ((inhibit-read-only t))
     (setq jjui--last-error nil)
-    (jjui--stop-process)
     (erase-buffer)
     (condition-case err
         (jjui--render-records (jjui--read-log-records) current-change-id
@@ -391,81 +455,9 @@ working-tree file.  For older revisions, open a read-only snapshot buffer."
       (error
        (jjui--render-error (error-message-string err))))))
 
-(defun jjui--log-refresh-async (current-change-id expanded-change-ids expanded-file-keys)
-  "Asynchronously refresh, preserving CURRENT-CHANGE-ID and expansion state."
-  (let ((inhibit-read-only t))
-    (setq jjui--last-error nil)
-    (jjui--stop-process)
-    (erase-buffer)
-    (condition-case err
-        (progn
-          (unless jjui--repo-root
-            (error "Not inside a Jujutsu repository"))
-          (unless (executable-find jjui-program)
-            (error "Cannot find `%s' in PATH" jjui-program))
-          (setq jjui--pending-output nil)
-          (jjui--insert-message "Loading jj log...")
-          (setq jjui--process
-                (let ((default-directory jjui--repo-root))
-                  (make-process
-                   :name "jjui-log"
-                   :buffer nil
-                   :command (cons jjui-program (jjui--log-args))
-                   :connection-type 'pipe
-                   :noquery t
-                   :filter #'jjui--process-filter
-                   :sentinel #'jjui--process-sentinel)))
-          (process-put jjui--process 'target-buffer (current-buffer))
-          (process-put jjui--process 'default-directory jjui--repo-root)
-          (process-put jjui--process 'current-change-id current-change-id)
-          (process-put jjui--process 'expanded-change-ids expanded-change-ids)
-          (process-put jjui--process 'expanded-file-keys expanded-file-keys))
-      (error
-       (jjui--render-error (error-message-string err))))))
-
-(defun jjui--stop-process ()
-  "Stop any in-flight async refresh for the current buffer."
-  (let ((proc jjui--process))
-    (setq jjui--process nil)
-    (when (process-live-p proc)
-      (delete-process proc)))
-  (setq jjui--pending-output nil))
-
-(defun jjui--process-filter (proc string)
-  "Accumulate process output from PROC with chunk STRING."
-  (when-let* ((buffer (process-get proc 'target-buffer)))
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (when (eq proc jjui--process)
-          (setq jjui--pending-output (concat jjui--pending-output string)))))))
-
-(defun jjui--process-sentinel (proc _event)
-  "Render async completion for PROC."
-  (when-let* ((buffer (process-get proc 'target-buffer)))
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (when (eq proc jjui--process)
-          (let ((output jjui--pending-output)
-                (status (process-exit-status proc))
-                (current-change-id (process-get proc 'current-change-id))
-                (expanded-change-ids (process-get proc 'expanded-change-ids))
-                (expanded-file-keys (process-get proc 'expanded-file-keys))
-                (inhibit-read-only t))
-            (setq jjui--process nil)
-            (setq jjui--pending-output nil)
-            (erase-buffer)
-            (if (zerop status)
-                (condition-case err
-                    (jjui--render-records (jjui--parse-log-output output)
-                                           current-change-id
-                                           expanded-change-ids
-                                           expanded-file-keys)
-                  (error
-                   (jjui--render-error (error-message-string err))))
-              (jjui--render-error (string-trim output)))))))))
-
 (defun jjui--render-records (records current-change-id expanded-change-ids expanded-file-keys)
   "Render RECORDS and restore CURRENT-CHANGE-ID and EXPANDED-CHANGE-IDS."
+  (setq jjui--records records)
   (if records
       (progn
         (jjui--insert-records records expanded-change-ids expanded-file-keys)
@@ -473,11 +465,13 @@ working-tree file.  For older revisions, open a read-only snapshot buffer."
         (unless (jjui--current-revision-section)
           (goto-char (point-min))
           (when (magit-section-at)
-            (magit-section-goto (magit-section-at)))))
+            (magit-section-goto (magit-section-at))))
+        (jjui--sync-abandon-overlays))
     (jjui--insert-message "No revisions to show.")))
 
 (defun jjui--render-error (message)
   "Render error MESSAGE in the current buffer."
+  (setq jjui--records nil)
   (setq jjui--last-error message)
   (jjui--insert-message message))
 
@@ -508,6 +502,149 @@ Signal an error if the process exits non-zero or the executable is missing."
         (unless (zerop exit-code)
           (error "%s" (string-trim (buffer-string))))
         (buffer-string)))))
+
+(defun jjui--run-mutation (thunk &rest plist)
+  "Run mutating THUNK with refresh and simple in-flight protection.
+Keyword args:
+:target is a commit id or a function returning one after success.
+:after-success is a function called before refreshing after success."
+  (when jjui--mutation-in-progress
+    (user-error "Another jj mutation is already running"))
+  (unless jjui--repo-root
+    (user-error "Not inside a Jujutsu repository"))
+  (let* ((jjui--mutation-in-progress t)
+         (target-spec (plist-get plist :target))
+         (after-success (plist-get plist :after-success))
+         (current-change-id (jjui--current-change-id))
+         (expanded-change-ids (jjui--expanded-change-ids))
+         (expanded-file-keys (jjui--expanded-file-keys))
+         (target current-change-id))
+    (unwind-protect
+        (condition-case err
+            (progn
+              (funcall thunk)
+              (when after-success
+                (funcall after-success))
+              (setq target (cond
+                            ((functionp target-spec) (funcall target-spec))
+                            (target-spec target-spec)
+                            (t current-change-id)))
+              (jjui--log-refresh-sync target expanded-change-ids expanded-file-keys))
+          (error
+           (message "%s" (error-message-string err))
+           nil))
+      (setq jjui--mutation-in-progress nil))))
+
+(defun jjui--require-current-commit-id ()
+  "Return the current revision commit id, or signal a user error."
+  (or (jjui--current-change-id)
+      (user-error "No revision selected")))
+
+(defun jjui--working-copy-commit-id ()
+  "Return the commit id for `@' in the current repository view."
+  (string-trim
+   (jjui--call-jj jjui--repo-root "log" "-r" "@"
+                   "--ignore-working-copy" "--no-graph"
+                   "--color" "never" "--template" "commit_id")))
+
+(defun jjui--revision-exists-p (commit-id)
+  "Return non-nil if COMMIT-ID exists in the current repo view."
+  (when commit-id
+    (condition-case nil
+        (not (string-empty-p
+              (string-trim
+               (jjui--call-jj jjui--repo-root "log" "-r" commit-id
+                               "--ignore-working-copy" "--no-graph"
+                               "--color" "never" "--template" "commit_id"))))
+      (error nil))))
+
+(defun jjui--selection-fallbacks (commit-id)
+  "Return candidate revisions to select if COMMIT-ID vanishes after mutation."
+  (let ((ids (jjui--revision-commit-ids)))
+    (when-let* ((pos (cl-position commit-id ids :test #'equal)))
+      (delq nil (list (nth (1+ pos) ids)
+                      (nth (1- pos) ids)
+                      (jjui--working-copy-commit-id))))))
+
+(defun jjui--revision-commit-ids ()
+  "Return commit ids for visible revision sections in buffer order."
+  (let (ids)
+    (when (bound-and-true-p magit-root-section)
+      (dolist (child (oref magit-root-section children))
+        (when (object-of-class-p child 'jjui-revision-section)
+          (push (oref child value) ids))))
+    (nreverse ids)))
+
+(defun jjui--prefixed-rev-args (commit-ids)
+  "Return `-r' args for COMMIT-IDS."
+  (cl-mapcan (lambda (commit-id) (list "-r" commit-id)) commit-ids))
+
+(defun jjui--abandon-toggle-current ()
+  "Toggle current revision in the abandon selection."
+  (unless jjui-abandon-mode
+    (user-error "Not in abandon mode"))
+  (let ((commit-id (jjui--require-current-commit-id))
+        (revision (jjui--current-revision-section)))
+    (setq jjui--abandon-selected-ids
+          (if (member commit-id jjui--abandon-selected-ids)
+              (cl-remove commit-id jjui--abandon-selected-ids :test #'equal)
+            (cons commit-id jjui--abandon-selected-ids)))
+    (jjui--restyle-abandon-revision revision commit-id)))
+
+(defun jjui--refresh-abandon-display ()
+  "Refresh abandon overlays in the current buffer."
+  (jjui--sync-abandon-overlays))
+
+(defun jjui--restyle-abandon-revision (revision commit-id)
+  "Update abandon styling overlay for REVISION in place."
+  (when revision
+    (let ((inhibit-read-only t))
+      (jjui--delete-abandon-overlay commit-id)
+      (when (member commit-id jjui--abandon-selected-ids)
+        (let ((overlay (make-overlay (oref revision start) (oref revision end) nil t t)))
+          (overlay-put overlay 'jjui-abandon-commit-id commit-id)
+          (overlay-put overlay 'face 'jjui-abandon-included-row)
+          (push overlay jjui--abandon-overlays))))))
+
+(defun jjui--sync-abandon-overlays ()
+  "Rebuild abandon overlays for all selected revisions in the current buffer."
+  (when jjui-abandon-mode
+    (jjui--clear-abandon-overlays)
+    (when (bound-and-true-p magit-root-section)
+      (dolist (revision (oref magit-root-section children))
+        (when (and (object-of-class-p revision 'jjui-revision-section)
+                   (member (oref revision value) jjui--abandon-selected-ids))
+          (jjui--restyle-abandon-revision revision (oref revision value)))))))
+
+(defun jjui--delete-abandon-overlay (commit-id)
+  "Delete the abandon overlay for COMMIT-ID, if present."
+  (setq jjui--abandon-overlays
+        (cl-remove-if (lambda (overlay)
+                        (when (equal (overlay-get overlay 'jjui-abandon-commit-id) commit-id)
+                          (delete-overlay overlay)
+                          t))
+                      jjui--abandon-overlays)))
+
+(defun jjui--clear-abandon-overlays ()
+  "Remove all abandon styling overlays from the current buffer."
+  (mapc #'delete-overlay jjui--abandon-overlays)
+  (setq jjui--abandon-overlays nil))
+
+(defun jjui--revision-heading-text (record)
+  "Return propertized heading text for revision RECORD."
+  (let* ((commit-id (plist-get record :commit-id))
+         (heading (jjui--ansi-colorize (plist-get record :heading))))
+    (ignore commit-id)
+    heading))
+
+(defun jjui--revision-summary-text (record)
+  "Return propertized summary text for revision RECORD."
+  (jjui--ansi-colorize (plist-get record :summary)))
+
+(defun jjui--body-text (string commit-id)
+  "Return propertized body STRING for COMMIT-ID, preserving color."
+  (ignore commit-id)
+  (jjui--ansi-colorize string))
 
 (defun jjui--parse-log-output (output)
   "Parse `jj log --summary' OUTPUT into revision records."
@@ -571,14 +708,12 @@ Signal an error if the process exits non-zero or the executable is missing."
     (if-let* ((graph (alist-get 'graph record)))
         (list :kind 'graph :heading graph)
     (let* ((heading-entry (alist-get 'heading record))
-           (summary (or (alist-get 'summary record) ""))
-           (body nil))
+           (summary (or (alist-get 'summary record) "")))
       (list :kind 'revision
             :change-id (plist-get heading-entry :change-id)
             :commit-id (plist-get heading-entry :commit-id)
             :heading (plist-get heading-entry :text)
-            :summary summary
-            :files body)))))
+            :summary summary)))))
 
 (defun jjui--insert-records (records expanded-change-ids expanded-file-keys)
   "Insert RECORDS, restoring expanded revisions and files from saved state."
@@ -595,10 +730,9 @@ Signal an error if the process exits non-zero or the executable is missing."
          (let* ((commit-id (plist-get record :commit-id))
                (expanded (member commit-id expanded-change-ids)))
            (magit-insert-section (jjui-revision-section commit-id)
-             (magit-insert-heading (jjui--ansi-colorize (plist-get record :heading)))
-             (magit-insert-section (jjui-summary-section commit-id (not expanded)
-                                                          :has-files t)
-               (magit-insert-heading (jjui--ansi-colorize (plist-get record :summary)))
+             (magit-insert-heading (jjui--revision-heading-text record))
+             (magit-insert-section (jjui-summary-section commit-id (not expanded))
+               (magit-insert-heading (jjui--revision-summary-text record))
                (magit-insert-section-body
                  (jjui--insert-file-summary commit-id expanded-file-keys))))))))))
 
@@ -641,12 +775,6 @@ Signal an error if the process exits non-zero or the executable is missing."
     (seq-find (lambda (child)
                 (object-of-class-p child 'jjui-summary-section))
               (oref revision children))))
-
-(defun jjui--sibling-revision (section direction)
-  "Return the next or previous revision sibling of SECTION in DIRECTION."
-  (seq-find (lambda (sibling)
-              (object-of-class-p sibling 'jjui-revision-section))
-            (magit-section-siblings section direction)))
 
 (defun jjui--next-section-from-point ()
   "Return the next section at or after point, or nil."
@@ -777,14 +905,14 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
                   (jjui--call-jj jjui--repo-root "diff" "--summary"
                                   "--color" "always" "-r" commit-id))))
     (if (string-empty-p output)
-        (insert (jjui--ansi-colorize (concat prefix "(no files changed)")) "\n")
+        (insert (jjui--body-text (concat prefix "(no files changed)") commit-id) "\n")
       (dolist (line (split-string output "\n"))
         (let* ((path (jjui--summary-line-path line))
                (expanded (member (cons commit-id path) expanded-file-keys)))
           (magit-insert-section (jjui-file-section (cons commit-id path) (not expanded)
                                                     :commit-id commit-id
                                                     :path path)
-            (magit-insert-heading (jjui--ansi-colorize (concat prefix line)))
+            (magit-insert-heading (jjui--body-text (concat prefix line) commit-id))
             (magit-insert-section-body
               (jjui--insert-file-diff commit-id path))))))))
 
@@ -809,8 +937,8 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
                                                 (list nil nil nil nil))))
                                  (unless inserted-preamble
                                    (dolist (line (nreverse preamble))
-                                     (insert (jjui--ansi-colorize
-                                              (concat prefix line)) "\n"))
+                                     (insert (jjui--body-text
+                                              (concat prefix line) commit-id) "\n"))
                                    (setq inserted-preamble t))
                                  (setq saw-hunk t)
                                  ;; Give each hunk a unique value so Magit can
@@ -823,9 +951,9 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
                                                                            :body-prefix prefix
                                                                            :body-lines body-lines)
                                    (magit-insert-heading
-                                    (jjui--ansi-colorize (concat prefix hunk-header)))
+                                    (jjui--body-text (concat prefix hunk-header) commit-id))
                                    (magit-insert-section-body
-                                     (jjui--insert-hunk-body-lines prefix body-lines)))
+                                     (jjui--insert-hunk-body-lines prefix body-lines commit-id)))
                                  (setq hunk-index (1+ hunk-index))
                                  (setq hunk-header nil)
                                  (setq hunk-body nil))))))
@@ -840,14 +968,15 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
       (flush-hunk)
       (unless inserted-preamble
         (dolist (line (nreverse preamble))
-          (insert (jjui--ansi-colorize (concat prefix line)) "\n")))
+          (insert (jjui--body-text (concat prefix line) commit-id) "\n")))
       (unless (or lines saw-hunk)
-        (insert (jjui--ansi-colorize (concat prefix "(no diff)")) "\n")))))
+        (insert (jjui--body-text (concat prefix "(no diff)") commit-id) "\n")))))
 
-(defun jjui--insert-hunk-body-lines (prefix body-lines)
-  "Insert BODY-LINES for a hunk using PREFIX and preserve color."
+(defun jjui--insert-hunk-body-lines (prefix body-lines commit-id)
+  "Insert BODY-LINES for a hunk using PREFIX and preserve color.
+Apply abandon styling for COMMIT-ID when relevant."
   (dolist (body-line body-lines)
-    (insert (jjui--ansi-colorize (concat prefix body-line)) "\n")))
+    (insert (jjui--body-text (concat prefix body-line) commit-id) "\n")))
 
 (defun jjui--prepare-missing-hunk-body (hunk)
   "If HUNK lost its body text while hidden, regenerate it on the next show.
@@ -858,10 +987,13 @@ an ancestor toggle, restore a one-shot washer right before reopening it."
              (null (oref hunk washer))
              (oref hunk body-lines))
     (let ((prefix (or (oref hunk body-prefix) ""))
-          (body-lines (oref hunk body-lines)))
+          (body-lines (oref hunk body-lines))
+          (commit-id (when-let* ((file (oref hunk parent)))
+                       (and (object-of-class-p file 'jjui-file-section)
+                            (oref file commit-id)))))
       (oset hunk washer
             (lambda ()
-              (jjui--insert-hunk-body-lines prefix body-lines))))))
+              (jjui--insert-hunk-body-lines prefix body-lines commit-id))))))
 
 (defun jjui--file-summary-prefix ()
   "Return the graph gutter prefix to use for lazily loaded file rows."
@@ -1093,19 +1225,6 @@ read-only snapshot."
     (forward-line (max 0 (1- line)))
     (when column
       (move-to-column column))))
-
-;;;; Compatibility aliases for the old `jj-ui' naming.
-
-(define-obsolete-function-alias 'jj-ui-log-mode #'jjui-log-mode "0.2.0")
-(define-obsolete-function-alias 'jj-ui-log #'jjui "0.2.0")
-(define-obsolete-function-alias 'jj-ui-log-refresh #'jjui-log-refresh "0.2.0")
-(define-obsolete-function-alias 'jj-ui-next-revision #'jjui-next-revision "0.2.0")
-(define-obsolete-function-alias 'jj-ui-previous-revision #'jjui-previous-revision "0.2.0")
-
-(defvaralias 'jj-ui-program 'jjui-program)
-(defvaralias 'jj-ui-log-revset 'jjui-log-revset)
-(defvaralias 'jj-ui-log-limit 'jjui-log-limit)
-(defvaralias 'jj-ui-log-async 'jjui-log-async)
 
 (provide 'jjui)
 
