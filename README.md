@@ -1,12 +1,26 @@
-# majjic
+# majjic (MAJ-jik)
 
-Magit-style Emacs UI for Jujutsu.
+[jjui](https://github.com/idursun/jjui) + [magit](https://github.com/magit/magit) inspired jj ui for Emacs!
 
-![majjic demo](./majjic-demo.gif)
+## Features
 
-[Screen recording](./majjic-demo.mov)
+### Expand Everything!
 
-## Commands
+![Expand Everything!](./media/expand_everything.gif)
+
+### Open Files!
+
+![Open Files!](./media/open_files.gif)
+
+### New and Edit Revisions!
+
+![New and Edit!](./media/new_and_edit.gif)
+
+### Abandon!
+
+![Abandon](./media/abandon.gif)
+
+## Command Reference
 
 - `M-x majjic` open the log
 - `TAB` expand or collapse a revision, file, or hunk
