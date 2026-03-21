@@ -21,6 +21,7 @@
 (require 'magit-section)
 (require 'subr-x)
 (require 'ansi-color)
+(require 'color)
 
 (defgroup majjic nil
   "Minimal UI for Jujutsu."
@@ -66,6 +67,9 @@ When nil, do not pass a limit to `jj log'."
 
 (defvar-local majjic--records nil
   "Last parsed log records rendered in the current buffer.")
+
+(defvar-local majjic--selected-hunk-heading-overlay nil
+  "Overlay used to emphasize the currently selected hunk header.")
 
 (defface majjic-abandon-included-row
   '((t :inherit shadow :strike-through t))
@@ -153,7 +157,8 @@ When nil, do not pass a limit to `jj log'."
   "Major mode for browsing `jj log' output."
   :group 'majjic
   (setq-local revert-buffer-function #'majjic--revert-buffer)
-  (setq-local truncate-lines t))
+  (setq-local truncate-lines t)
+  (add-hook 'post-command-hook #'majjic--update-selected-hunk-heading nil t))
 
 (defvar-keymap majjic-snapshot-mode-map
   :parent special-mode-map
@@ -520,12 +525,22 @@ Follow Magit's naming style with a repo-specific buffer when possible."
 Signal an error if the process exits non-zero or the executable is missing."
   (unless (executable-find majjic-program)
     (error "Cannot find `%s' in PATH" majjic-program))
-  (with-temp-buffer
-    (let ((default-directory dir))
-      (let ((exit-code (apply #'process-file majjic-program nil (current-buffer) nil args)))
-        (unless (zerop exit-code)
-          (error "%s" (string-trim (buffer-string))))
-        (buffer-string)))))
+  (let ((stderr-file (make-temp-file "majjic-jj-stderr-")))
+    (unwind-protect
+        (with-temp-buffer
+          (let ((default-directory dir))
+            (let ((exit-code (apply #'process-file majjic-program nil
+                                    (list (current-buffer) stderr-file) nil args))
+                  (stdout (buffer-string)))
+              (if (zerop exit-code)
+                  stdout
+                (let ((stderr (with-temp-buffer
+                                (insert-file-contents stderr-file)
+                                (buffer-string))))
+                  (error "%s" (string-trim (if (string-blank-p stderr)
+                                               stdout
+                                             stderr))))))))
+      (ignore-errors (delete-file stderr-file)))))
 
 (defun majjic--run-mutation (thunk &rest plist)
   "Run mutating THUNK with refresh and simple in-flight protection.
@@ -669,6 +684,68 @@ Keyword args:
   "Return propertized body STRING for COMMIT-ID, preserving color."
   (ignore commit-id)
   (majjic--ansi-colorize string))
+
+(defun majjic--file-heading-text (string)
+  "Return heading text for a file summary STRING.
+Keep the diff status indicator colorized, but render the path itself in the
+default face so file boundaries stay distinct from hunk text."
+  (let* ((colored (majjic--ansi-colorize string))
+         (text (majjic--strip-ansi string)))
+    (when (> (length text) 0)
+      (put-text-property 0 (length text) 'face 'default text))
+    (when (string-match "\\`[[:space:]│├└┼┤┬╯╮╭╰─]*\\(\\S-+\\)\\([[:space:]]+\\)" text)
+      (let* ((beg (match-beginning 1))
+             (end (match-end 1))
+             (status-face (or (get-text-property beg 'face colored)
+                              (get-text-property beg 'font-lock-face colored))))
+        (when status-face
+          (put-text-property beg end 'face status-face text))))
+    text))
+
+(defun majjic--apply-hunk-heading-background (start end)
+  "Overlay a darker background on the hunk heading from START to END.
+Use an overlay instead of text properties because Magit section rendering can
+discard appended face properties on the final inserted heading text."
+  (let ((overlay (make-overlay start end)))
+    (overlay-put overlay 'face (majjic--hunk-heading-face))
+    (overlay-put overlay 'priority 1000)
+    (overlay-put overlay 'evaporate t)
+    overlay))
+
+(defun majjic--hunk-heading-face (&optional selected)
+  "Return a theme-relative face for hunk headings.
+Make the background slightly darker than `magit-section-highlight'.  When
+SELECTED is non-nil, keep the same background and add bold weight only."
+  (let* ((highlight-bg (face-attribute 'magit-section-highlight :background nil t))
+         (background (when (majjic--usable-color-p highlight-bg)
+                       (condition-case nil
+                           (color-darken-name highlight-bg 8)
+                         (error nil)))))
+    (append (list :inherit 'magit-section-highlight :extend t)
+            (when background
+              (list :background background))
+            (when selected
+              (list :weight 'bold)))))
+
+(defun majjic--usable-color-p (color)
+  "Return non-nil if COLOR is a concrete color string."
+  (and (stringp color)
+       (not (member color '("unspecified" "unspecified-bg" "unspecified-fg")))))
+
+(defun majjic--update-selected-hunk-heading ()
+  "Bold the hunk header at point, if point is on a hunk heading line."
+  (when (overlayp majjic--selected-hunk-heading-overlay)
+    (delete-overlay majjic--selected-hunk-heading-overlay))
+  (setq majjic--selected-hunk-heading-overlay nil)
+  (when-let* ((section (magit-current-section)))
+    (when (and (object-of-class-p section 'majjic-hunk-section)
+               (< (point) (oref section content)))
+      (let ((overlay (make-overlay (line-beginning-position)
+                                   (min (point-max) (1+ (line-end-position))))))
+        (overlay-put overlay 'face (majjic--hunk-heading-face t))
+        (overlay-put overlay 'priority 1001)
+        (overlay-put overlay 'evaporate t)
+        (setq majjic--selected-hunk-heading-overlay overlay)))))
 
 (defun majjic--parse-log-output (output)
   "Parse `jj log --summary' OUTPUT into revision records."
@@ -933,13 +1010,13 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
       (dolist (line (split-string output "\n"))
         (if (majjic--rename-summary-line-p line)
             (magit-insert-section (majjic-rename-section nil nil :commit-id commit-id)
-              (magit-insert-heading (majjic--body-text (concat prefix line) commit-id)))
+              (magit-insert-heading (majjic--file-heading-text (concat prefix line))))
           (let* ((path (majjic--summary-line-path line))
                  (expanded (member (cons commit-id path) expanded-file-keys)))
             (magit-insert-section (majjic-file-section (cons commit-id path) (not expanded)
                                                       :commit-id commit-id
                                                       :path path)
-              (magit-insert-heading (majjic--body-text (concat prefix line) commit-id))
+              (magit-insert-heading (majjic--file-heading-text (concat prefix line)))
               (magit-insert-section-body
                 (majjic--insert-file-diff commit-id path)))))))))
 
@@ -950,11 +1027,9 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
                   (majjic--call-jj majjic--repo-root "diff" "--git"
                                   "--color" "always" "-r" commit-id "--" path)))
          (lines (if (string-empty-p output) nil (split-string output "\n")))
-         (preamble nil)
          (hunk-header nil)
          (hunk-body nil)
          (saw-hunk nil)
-         (inserted-preamble nil)
          (hunk-index 0))
     (cl-labels ((flush-hunk ()
                            (when hunk-header
@@ -962,11 +1037,6 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
                                (pcase-let* ((`(,old-start ,old-count ,new-start ,new-count)
                                             (or (majjic--parse-hunk-header hunk-header)
                                                 (list nil nil nil nil))))
-                                 (unless inserted-preamble
-                                   (dolist (line (nreverse preamble))
-                                     (insert (majjic--body-text
-                                              (concat prefix line) commit-id) "\n"))
-                                   (setq inserted-preamble t))
                                  (setq saw-hunk t)
                                  ;; Give each hunk a unique value so Magit can
                                  ;; track nested visibility independently.
@@ -975,10 +1045,13 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
                                                                            :old-count old-count
                                                                            :new-start new-start
                                                                            :new-count new-count
-                                                                           :body-prefix prefix
-                                                                           :body-lines body-lines)
-                                   (magit-insert-heading
-                                    (majjic--body-text (concat prefix hunk-header) commit-id))
+                                   :body-prefix prefix
+                                   :body-lines body-lines)
+                                   (let ((heading-start (point)))
+                                     (magit-insert-heading
+                                      (majjic--body-text (concat prefix hunk-header) commit-id))
+                                     (majjic--apply-hunk-heading-background
+                                      heading-start (point)))
                                    (magit-insert-section-body
                                      (majjic--insert-hunk-body-lines prefix body-lines commit-id)))
                                  (setq hunk-index (1+ hunk-index))
@@ -989,14 +1062,10 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
             (progn
               (flush-hunk)
               (setq hunk-header line))
-          (if hunk-header
-              (push line hunk-body)
-            (push line preamble))))
+          (when hunk-header
+            (push line hunk-body))))
       (flush-hunk)
-      (unless inserted-preamble
-        (dolist (line (nreverse preamble))
-          (insert (majjic--body-text (concat prefix line) commit-id) "\n")))
-      (unless (or lines saw-hunk)
+      (unless saw-hunk
         (insert (majjic--body-text (concat prefix "(no diff)") commit-id) "\n")))))
 
 (defun majjic--insert-hunk-body-lines (prefix body-lines commit-id)
@@ -1259,6 +1328,35 @@ read-only snapshot."
     (forward-line (max 0 (1- line)))
     (when column
       (move-to-column column))))
+
+(defun majjic-debug-display-at-point ()
+  "Report the rendered face and overlay state at point.
+This is meant for diagnosing visual issues where the final display differs from
+the text properties produced by `majjic' helpers."
+  (interactive)
+  (let* ((library (locate-library "majjic"))
+         (section (ignore-errors (magit-current-section)))
+         (info (list :library library
+                     :buffer (buffer-name)
+                     :point (point)
+                     :line (line-number-at-pos)
+                     :column (current-column)
+                     :char (char-after)
+                     :text-face (get-text-property (point) 'face)
+                     :text-font-lock-face (get-text-property (point) 'font-lock-face)
+                     :face-at-point (face-at-point nil t)
+                     :overlays (mapcar (lambda (overlay)
+                                         (list :start (overlay-start overlay)
+                                               :end (overlay-end overlay)
+                                               :priority (overlay-get overlay 'priority)
+                                               :face (overlay-get overlay 'face)))
+                                       (overlays-at (point)))
+                     :section-type (and section (eieio-object-class-name section))
+                     :section-hidden (and section (slot-boundp section 'hidden)
+                                          (oref section hidden)))))
+    (if (called-interactively-p 'interactive)
+        (message "%S" info)
+      info)))
 
 (provide 'majjic)
 
