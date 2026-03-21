@@ -808,11 +808,17 @@ SELECTED is non-nil, keep the same background and add bold weight only."
       (list :kind 'elided :heading elided)
     (if-let* ((graph (alist-get 'graph record)))
         (list :kind 'graph :heading graph)
-    (let* ((heading-entry (alist-get 'heading record))
-           (summary (or (alist-get 'summary record) "")))
+      (let* ((heading-entry (alist-get 'heading record))
+             (commit-id (plist-get heading-entry :commit-id))
+             (summary (or (alist-get 'summary record) "")))
+        ;; The synthetic root revision has no description line in `jj log', but
+        ;; the trailing newline can otherwise be normalized into our placeholder.
+        (when (and (majjic--root-commit-id-p commit-id)
+                   (string-match-p "(no description set)" summary))
+          (setq summary nil))
       (list :kind 'revision
             :change-id (plist-get heading-entry :change-id)
-            :commit-id (plist-get heading-entry :commit-id)
+            :commit-id commit-id
             :heading (plist-get heading-entry :text)
             :summary summary)))))
 
@@ -832,10 +838,11 @@ SELECTED is non-nil, keep the same background and add bold weight only."
                (expanded (member commit-id expanded-change-ids)))
            (magit-insert-section (majjic-revision-section commit-id)
              (magit-insert-heading (majjic--revision-heading-text record))
-             (magit-insert-section (majjic-summary-section commit-id (not expanded))
-               (magit-insert-heading (majjic--revision-summary-text record))
-               (magit-insert-section-body
-                 (majjic--insert-file-summary commit-id expanded-file-keys))))))))))
+             (when-let* ((summary (plist-get record :summary)))
+               (magit-insert-section (majjic-summary-section commit-id (not expanded))
+                 (magit-insert-heading (majjic--ansi-colorize summary))
+                 (magit-insert-section-body
+                   (majjic--insert-file-summary commit-id expanded-file-keys)))))))))))
 
 (defun majjic--insert-message (message)
   "Insert MESSAGE as plain buffer contents."
@@ -970,7 +977,8 @@ like \"│\" or \"│ │\" to avoid adding extra blank space between revisions.
   (let ((plain (string-trim (majjic--strip-ansi line))))
     (and (not (string-empty-p plain))
          (not (string-match-p "[[:alnum:]]" plain))
-         (string-match-p "[├└┼┤┬╯╮╭╰─]" plain))))
+         (or (string= plain "~")
+             (string-match-p "[├└┼┤┬╯╮╭╰─]" plain)))))
 
 (defun majjic--ansi-colorize (string)
   "Return STRING with ANSI escapes converted to text properties."
@@ -1123,6 +1131,11 @@ files align under the revision while preserving branch columns."
   (if (string-match-p "[[:alnum:]]" line)
       line
     (concat line "(no description set)")))
+
+(defun majjic--root-commit-id-p (commit-id)
+  "Return non-nil if COMMIT-ID is Jujutsu's synthetic root commit."
+  (and (stringp commit-id)
+       (string-match-p "\\`0+\\'" commit-id)))
 
 (defun majjic--summary-line-path (line)
   "Extract a path from a `jj diff --summary' LINE."
