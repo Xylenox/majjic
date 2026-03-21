@@ -94,7 +94,8 @@ When nil, do not pass a limit to `jj log'."
    (old-count :initarg :old-count)
    (new-start :initarg :new-start)
    (new-count :initarg :new-count)
-   (body-prefix :initarg :body-prefix)))
+   (body-prefix :initarg :body-prefix)
+   (body-lines :initarg :body-lines)))
 
 (defclass jjui-root-section (magit-section) ())
 
@@ -321,6 +322,9 @@ toggle that section's body."
       (user-error "No section at point"))
      ((or (object-of-class-p section 'jjui-file-section)
           (object-of-class-p section 'jjui-hunk-section))
+      (when (and (object-of-class-p section 'jjui-hunk-section)
+                 (oref section hidden))
+        (jjui--prepare-missing-hunk-body section))
       (magit-section-toggle section))
      (t
       (let* ((revision (jjui--current-revision-section))
@@ -799,32 +803,32 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
          (hunk-index 0))
     (cl-labels ((flush-hunk ()
                            (when hunk-header
-                             (pcase-let* ((`(,old-start ,old-count ,new-start ,new-count)
-                                          (or (jjui--parse-hunk-header hunk-header)
-                                              (list nil nil nil nil))))
-                             (unless inserted-preamble
-                               (dolist (line (nreverse preamble))
-                                 (insert (jjui--ansi-colorize
-                                          (concat prefix line)) "\n"))
-                               (setq inserted-preamble t))
-                             (setq saw-hunk t)
-                             ;; Give each hunk a unique value so Magit can
-                             ;; track nested visibility independently.
-                             (magit-insert-section (jjui-hunk-section hunk-index nil
-                                                                       :old-start old-start
-                                                                       :old-count old-count
-                                                                       :new-start new-start
-                                                                       :new-count new-count
-                                                                       :body-prefix prefix)
-                               (magit-insert-heading
-                                (jjui--ansi-colorize (concat prefix hunk-header)))
-                               (magit-insert-section-body
-                                 (dolist (body-line (nreverse hunk-body))
-                                   (insert (jjui--ansi-colorize
-                                            (concat prefix body-line)) "\n"))))
-                             (setq hunk-index (1+ hunk-index))
-                             (setq hunk-header nil)
-                             (setq hunk-body nil)))))
+                             (let ((body-lines (nreverse hunk-body)))
+                               (pcase-let* ((`(,old-start ,old-count ,new-start ,new-count)
+                                            (or (jjui--parse-hunk-header hunk-header)
+                                                (list nil nil nil nil))))
+                                 (unless inserted-preamble
+                                   (dolist (line (nreverse preamble))
+                                     (insert (jjui--ansi-colorize
+                                              (concat prefix line)) "\n"))
+                                   (setq inserted-preamble t))
+                                 (setq saw-hunk t)
+                                 ;; Give each hunk a unique value so Magit can
+                                 ;; track nested visibility independently.
+                                 (magit-insert-section (jjui-hunk-section hunk-index nil
+                                                                           :old-start old-start
+                                                                           :old-count old-count
+                                                                           :new-start new-start
+                                                                           :new-count new-count
+                                                                           :body-prefix prefix
+                                                                           :body-lines body-lines)
+                                   (magit-insert-heading
+                                    (jjui--ansi-colorize (concat prefix hunk-header)))
+                                   (magit-insert-section-body
+                                     (jjui--insert-hunk-body-lines prefix body-lines)))
+                                 (setq hunk-index (1+ hunk-index))
+                                 (setq hunk-header nil)
+                                 (setq hunk-body nil))))))
       (dolist (line lines)
         (if (jjui--hunk-header-line-p line)
             (progn
@@ -839,6 +843,25 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
           (insert (jjui--ansi-colorize (concat prefix line)) "\n")))
       (unless (or lines saw-hunk)
         (insert (jjui--ansi-colorize (concat prefix "(no diff)")) "\n")))))
+
+(defun jjui--insert-hunk-body-lines (prefix body-lines)
+  "Insert BODY-LINES for a hunk using PREFIX and preserve color."
+  (dolist (body-line body-lines)
+    (insert (jjui--ansi-colorize (concat prefix body-line)) "\n")))
+
+(defun jjui--prepare-missing-hunk-body (hunk)
+  "If HUNK lost its body text while hidden, regenerate it on the next show.
+`magit-insert-section-body' only installs a washer for sections that start out
+hidden.  Our hunks start expanded, so if a hidden hunk's body disappears after
+an ancestor toggle, restore a one-shot washer right before reopening it."
+  (when (and (= (oref hunk content) (oref hunk end))
+             (null (oref hunk washer))
+             (oref hunk body-lines))
+    (let ((prefix (or (oref hunk body-prefix) ""))
+          (body-lines (oref hunk body-lines)))
+      (oset hunk washer
+            (lambda ()
+              (jjui--insert-hunk-body-lines prefix body-lines))))))
 
 (defun jjui--file-summary-prefix ()
   "Return the graph gutter prefix to use for lazily loaded file rows."
@@ -861,7 +884,7 @@ files align under the revision while preserving branch columns."
                     ((eq char ?│) ?│)
                     ;; Elbows/tees with a downward segment should continue as a
                     ;; vertical line through expanded child rows.
-                    ((memq char '(?├ ?┼ ?┤ ?┬)) ?│)
+                    ((memq char '(?├ ?┼ ?┤ ?┬ ?┌ ?┐ ?╭ ?╮)) ?│)
                     ((eq char ?\s) ?\s)
                     ((eq char ?\t) ?\t)
                     (t ?\s)))
