@@ -83,6 +83,10 @@ When nil, do not pass a limit to `jj log'."
    (commit-id :initarg :commit-id)
    (path :initarg :path)))
 
+(defclass majjic-rename-section (magit-section)
+  ((keymap :initform 'majjic-summary-section-map)
+   (commit-id :initarg :commit-id)))
+
 (defclass majjic-hunk-section (magit-section)
   ((keymap :initform 'majjic-hunk-section-map)
    (old-start :initarg :old-start)
@@ -196,12 +200,13 @@ section bindings that would otherwise page the buffer."
 (defun majjic ()
   "Open a Jujutsu log buffer for the current repository."
   (interactive)
-  (let ((buffer (get-buffer-create "*jj-log*"))
-        (source-dir default-directory))
+  (let* ((source-dir default-directory)
+         (repo-root (majjic--locate-root source-dir))
+         (buffer (get-buffer-create (majjic--log-buffer-name repo-root))))
     (with-current-buffer buffer
       (majjic-log-mode)
       (setq default-directory source-dir)
-      (setq majjic--repo-root (majjic--locate-root source-dir))
+      (setq majjic--repo-root repo-root)
       (majjic-log-refresh))
     (pop-to-buffer buffer)))
 
@@ -398,6 +403,8 @@ toggle that section's body."
       (when-let* ((revision (and majjic-abandon-mode (majjic--current-revision-section)))
                   (commit-id (oref revision value)))
         (majjic--restyle-abandon-revision revision commit-id)))
+     ((object-of-class-p section 'majjic-rename-section)
+      (user-error "Rename rows do not expand yet"))
      (t
       (let* ((revision (majjic--current-revision-section))
              (summary (majjic--summary-child revision)))
@@ -446,6 +453,14 @@ working-tree file.  For older revisions, open a read-only snapshot buffer."
      (let ((default-workspace (expand-file-name "default" dir)))
        (when (file-directory-p (expand-file-name ".jj" default-workspace))
          default-workspace)))))
+
+(defun majjic--log-buffer-name (repo-root)
+  "Return the log buffer name for REPO-ROOT.
+Follow Magit's naming style with a repo-specific buffer when possible."
+  (if repo-root
+      (format "majjic: %s"
+              (file-name-nondirectory (directory-file-name repo-root)))
+    "majjic"))
 
 (defun majjic--read-log-records ()
   "Return parsed revision records for the current buffer's repository."
@@ -916,14 +931,17 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
     (if (string-empty-p output)
         (insert (majjic--body-text (concat prefix "(no files changed)") commit-id) "\n")
       (dolist (line (split-string output "\n"))
-        (let* ((path (majjic--summary-line-path line))
-               (expanded (member (cons commit-id path) expanded-file-keys)))
-          (magit-insert-section (majjic-file-section (cons commit-id path) (not expanded)
-                                                    :commit-id commit-id
-                                                    :path path)
-            (magit-insert-heading (majjic--body-text (concat prefix line) commit-id))
-            (magit-insert-section-body
-              (majjic--insert-file-diff commit-id path))))))))
+        (if (majjic--rename-summary-line-p line)
+            (magit-insert-section (majjic-rename-section nil nil :commit-id commit-id)
+              (magit-insert-heading (majjic--body-text (concat prefix line) commit-id)))
+          (let* ((path (majjic--summary-line-path line))
+                 (expanded (member (cons commit-id path) expanded-file-keys)))
+            (magit-insert-section (majjic-file-section (cons commit-id path) (not expanded)
+                                                      :commit-id commit-id
+                                                      :path path)
+              (magit-insert-heading (majjic--body-text (concat prefix line) commit-id))
+              (magit-insert-section-body
+                (majjic--insert-file-diff commit-id path)))))))))
 
 (defun majjic--insert-file-diff (commit-id path)
   "Insert hunk sections for PATH in COMMIT-ID."
@@ -1043,6 +1061,13 @@ files align under the revision while preserving branch columns."
     (if (string-match "\\`[^[:space:]]+[[:space:]]+\\(.+\\)\\'" plain)
         (majjic--normalize-summary-path (match-string 1 plain))
       plain)))
+
+(defun majjic--rename-summary-line-p (line)
+  "Return non-nil if summary LINE is a rename row.
+Rename summaries like \"R {old => new}\" are display-only for now because they
+do not expand cleanly to a single path."
+  (let ((plain (majjic--strip-ansi line)))
+    (string-match-p "\\`R[[:space:]]+{.+ => .+}\\'" plain)))
 
 (defun majjic--normalize-summary-path (path)
   "Return the likely working-tree path from summary PATH text."
