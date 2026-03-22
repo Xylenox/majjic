@@ -85,6 +85,7 @@ When nil, do not pass a limit to `jj log'."
 (declare-function majjic--effective-undo-operation-preview "majjic-jj")
 (declare-function majjic--op-log-preview "majjic-jj")
 (declare-function majjic--redo-args "majjic-jj")
+(declare-function majjic--rebase-moved-change-ids "majjic-jj")
 (declare-function majjic--rebase-target-mode-label "majjic-render")
 (declare-function majjic--sync-rebase-overlays "majjic-render")
 (declare-function majjic--undo-args "majjic-jj")
@@ -162,6 +163,8 @@ When nil, do not pass a limit to `jj log'."
   "o" #'majjic-rebase-set-onto
   "a" #'majjic-rebase-set-after
   "b" #'majjic-rebase-set-before
+  "r" #'majjic-rebase-set-source-revision
+  "s" #'majjic-rebase-set-source-descendants
   "RET" #'majjic-rebase-apply
   "<return>" #'majjic-rebase-apply
   "C-g" #'majjic-rebase-cancel)
@@ -381,19 +384,23 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
   (user-error "Disabled in abandon mode"))
 
 (defun majjic-rebase-start ()
-  "Enter rebase mode using the current revision as the source."
+  "Enter rebase mode using the current revision as the source.
+When already in rebase mode, switch the source back to a single revision."
   (interactive)
   (when majjic-abandon-mode
     (majjic-abandon-disabled-command))
-  (when majjic-rebase-mode
-    (user-error "Already in rebase mode"))
-  (setq majjic--rebase-state
-        (make-majjic-rebase-state
-         :source-change-id (majjic--change-id-for-commit-id
-                            (majjic--require-current-commit-id))
-         :target-mode 'onto))
-  (majjic-rebase-mode 1)
-  (message "Rebase mode: o onto, a after, b before, RET apply, C-g cancel"))
+  (if majjic-rebase-mode
+      (majjic-rebase-set-source-revision)
+    (let ((source-change-id (majjic--change-id-for-commit-id
+                             (majjic--require-current-commit-id))))
+      (setq majjic--rebase-state
+            (make-majjic-rebase-state
+             :source-change-id source-change-id
+             :source-mode 'revision
+             :moved-change-ids (majjic--rebase-moved-change-ids source-change-id 'revision)
+             :target-mode 'onto))
+      (majjic-rebase-mode 1)
+      (message "Rebase mode: r revision, s descendants, o onto, a after, b before, RET apply, C-g cancel"))))
 
 (defun majjic-rebase-set-onto ()
   "Set the rebase target placement to onto."
@@ -410,6 +417,16 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
   (interactive)
   (majjic--rebase-set-target-mode 'before))
 
+(defun majjic-rebase-set-source-revision ()
+  "Set the rebase source to the selected revision only."
+  (interactive)
+  (majjic--rebase-set-source-mode 'revision))
+
+(defun majjic-rebase-set-source-descendants ()
+  "Set the rebase source to the selected revision and its descendants."
+  (interactive)
+  (majjic--rebase-set-source-mode 'descendants))
+
 (defun majjic-rebase-apply ()
   "Apply the staged rebase."
   (interactive)
@@ -418,13 +435,18 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
   (let* ((source (majjic-rebase-state-source-change-id majjic--rebase-state))
          (target (majjic--require-current-commit-id))
          (target-change-id (majjic--change-id-for-commit-id target))
+         (source-mode (majjic-rebase-state-source-mode majjic--rebase-state))
+         (moved-change-ids (majjic-rebase-state-moved-change-ids majjic--rebase-state))
          (target-mode (majjic-rebase-state-target-mode majjic--rebase-state)))
     (when (equal source target-change-id)
       (user-error "Rebase source and target are the same revision"))
+    (when (and (eq source-mode 'descendants)
+               (member target-change-id moved-change-ids))
+      (user-error "Rebase target is inside moved revisions"))
     (majjic--run-mutation
      (lambda ()
        (apply #'majjic--call-jj majjic--repo-root
-              (majjic--rebase-args source target target-mode)))
+              (majjic--rebase-args source target target-mode source-mode)))
      :after-success (lambda ()
                       (majjic-rebase-mode -1))
      :target (lambda ()
@@ -505,6 +527,19 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
   (setf (majjic-rebase-state-target-mode majjic--rebase-state) target-mode)
   (majjic--sync-rebase-overlays)
   (message "Rebase target: %s" (majjic--rebase-target-mode-label target-mode)))
+
+(defun majjic--rebase-set-source-mode (source-mode)
+  "Set SOURCE-MODE in the current rebase state."
+  (unless majjic-rebase-mode
+    (user-error "Not in rebase mode"))
+  (setf (majjic-rebase-state-source-mode majjic--rebase-state) source-mode)
+  (setf (majjic-rebase-state-moved-change-ids majjic--rebase-state)
+        (majjic--rebase-moved-change-ids
+         (majjic-rebase-state-source-change-id majjic--rebase-state)
+         source-mode))
+  (majjic--sync-rebase-overlays)
+  (message "Rebase source: %s"
+           (if (eq source-mode 'descendants) "descendants" "revision")))
 
 (defun majjic-section-forward ()
   "Move to the beginning of the next visible section.
@@ -701,6 +736,11 @@ Follow Magit's naming style with a repo-specific buffer when possible."
   "Render RECORDS and restore UI STATE."
   (setq majjic--abandon-selected-ids (majjic-state-abandon-selected-ids state))
   (setq majjic--rebase-state (majjic-state-rebase-state state))
+  (when majjic--rebase-state
+    (setf (majjic-rebase-state-moved-change-ids majjic--rebase-state)
+          (majjic--rebase-moved-change-ids
+           (majjic-rebase-state-source-change-id majjic--rebase-state)
+           (or (majjic-rebase-state-source-mode majjic--rebase-state) 'revision))))
   (if records
       (progn
         (majjic--insert-records records

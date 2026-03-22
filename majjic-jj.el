@@ -272,10 +272,27 @@ LIMIT defaults to 1."
              (majjic--operation-log-entry (majjic-operation-record-id subject) t))
        "\n"))))
 
-(defun majjic--rebase-args (source target target-mode)
+(defun majjic--rebase-moved-change-ids (source-change-id source-mode)
+  "Return change ids moved by rebasing SOURCE-CHANGE-ID in SOURCE-MODE."
+  (if (eq source-mode 'descendants)
+      (seq-remove #'string-empty-p
+                  (split-string
+                   (string-trim
+                    (majjic--call-jj majjic--repo-root "log"
+                                     "-r" (format "(%s)::" source-change-id)
+                                     "--no-graph" "--color" "never"
+                                     "--template" "change_id ++ \"\\n\""
+                                     "--ignore-working-copy" "--no-pager"))
+                   "\n" t))
+    (list source-change-id)))
+
+(defun majjic--rebase-args (source target target-mode &optional source-mode)
   "Return `jj rebase' arguments for SOURCE onto/after/before TARGET.
-TARGET-MODE is one of `onto', `after', or `before'."
-  (append (list "rebase" "-r" source)
+TARGET-MODE is one of `onto', `after', or `before'.
+SOURCE-MODE is one of `revision' or `descendants', defaulting to `revision'."
+  (append (list "rebase"
+                (if (eq source-mode 'descendants) "--source" "--revisions")
+                source)
           (pcase target-mode
             ('after (list "--insert-after" target))
             ('before (list "--insert-before" target))

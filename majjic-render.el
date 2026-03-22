@@ -308,16 +308,18 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
   (when (and majjic-rebase-mode
              majjic--rebase-state
              (bound-and-true-p magit-root-section))
-    (when-let* ((source-section
-                 (majjic--revision-section-by-id
-                  (majjic--commit-id-for-change-id
-                   (majjic-rebase-state-source-change-id majjic--rebase-state)))))
-      (majjic--add-rebase-source-overlay source-section))
+    (let ((moved-change-ids (or (majjic-rebase-state-moved-change-ids majjic--rebase-state)
+                                (list (majjic-rebase-state-source-change-id majjic--rebase-state)))))
+      (dolist (revision (oref magit-root-section children))
+        (when (and (object-of-class-p revision 'majjic-revision-section)
+                   (majjic--revision-section-moved-p revision moved-change-ids))
+          (majjic--add-rebase-source-overlay revision))))
     (when-let* ((target-section (majjic--current-revision-section)))
       (majjic--add-rebase-target-overlay
        target-section
        (majjic-rebase-state-source-change-id majjic--rebase-state)
        (oref target-section value)
+       (majjic-rebase-state-source-mode majjic--rebase-state)
        (majjic-rebase-state-target-mode majjic--rebase-state)))))
 
 (defun majjic--revision-section-by-id (commit-id)
@@ -344,15 +346,19 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
       (overlay-put overlay 'evaporate t)
       (push overlay majjic--rebase-overlays))))
 
-(defun majjic--add-rebase-target-overlay (section source target target-mode)
-  "Add the target summary overlay to SECTION for SOURCE, TARGET, and TARGET-MODE."
+(defun majjic--add-rebase-target-overlay (section source target source-mode target-mode)
+  "Add the target summary overlay to SECTION for SOURCE, TARGET, and TARGET-MODE.
+SOURCE-MODE controls whether the summary says revision or descendants."
   (when (and source target (markerp (oref section start)) (markerp (oref section content)))
     (let* ((label (majjic--rebase-target-mode-label target-mode))
            (prefix (majjic--rebase-target-summary-prefix section target-mode))
+           (source-text (if (eq source-mode 'descendants)
+                            "rebase itself and descendants of "
+                          "rebase revision "))
            (summary (concat (propertize (format "<< %s >>" label)
                                         'face '(:inherit shadow :weight bold))
                             " "
-                            (propertize "rebase revision " 'face 'shadow)
+                            (propertize source-text 'face 'shadow)
                             (propertize (majjic--short-change-id source) 'face 'font-lock-keyword-face)
                             " "
                             (propertize label 'face 'shadow)
@@ -397,6 +403,24 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
          (if (string-match "\\`[^[:alnum:]]*" line)
              (match-end 0)
            0)))))
+
+(defun majjic--revision-section-change-id (section)
+  "Return the visible change id text from revision SECTION's heading."
+  (save-excursion
+    (goto-char (oref section start))
+    (let ((line (buffer-substring-no-properties (line-beginning-position)
+                                                (line-end-position))))
+      (when (string-match "\\`[^[:alnum:]]*\\([[:alnum:]]+\\)" line)
+        (match-string 1 line)))))
+
+(defun majjic--revision-section-moved-p (section moved-change-ids)
+  "Return non-nil if SECTION's visible change id matches MOVED-CHANGE-IDS."
+  (when-let* ((visible-change-id (majjic--revision-section-change-id section)))
+    (seq-some (lambda (change-id)
+                (or (equal visible-change-id change-id)
+                    (string-prefix-p visible-change-id change-id)
+                    (string-prefix-p change-id visible-change-id)))
+              moved-change-ids)))
 
 (defun majjic--rebase-target-summary-prefix (section target-mode)
   "Return a graph prefix for a transient target summary near SECTION.

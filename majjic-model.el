@@ -28,6 +28,8 @@
 (cl-defstruct majjic-rebase-state
   "Transient state for `majjic-rebase-mode'."
   source-change-id
+  source-mode
+  moved-change-ids
   target-mode)
 
 (cl-defstruct majjic-revision
