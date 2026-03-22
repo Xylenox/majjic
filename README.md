@@ -4,7 +4,7 @@
 
 ## Demo
 
-![Demo](./media/majjic_demo.mov)
+https://github.com/user-attachments/assets/9da48e9c-72da-463d-91a3-b97fefcf597d
 
 ## Command Reference
 
