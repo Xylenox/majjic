@@ -185,21 +185,31 @@
       (pcase (majjic-revision-kind record)
         ('elided
          (magit-insert-section (majjic-elided-section)
-           (magit-insert-heading (majjic--ansi-colorize (majjic-revision-heading record)))))
+           (magit-insert-heading
+            (majjic--top-level-row-text
+             (majjic--ansi-colorize (majjic-revision-heading record))))))
         ('graph
          (magit-insert-section (majjic-graph-line-section)
-           (magit-insert-heading (majjic--ansi-colorize (majjic-revision-heading record)))))
+           (magit-insert-heading
+            (majjic--top-level-row-text
+             (majjic--ansi-colorize (majjic-revision-heading record))))))
          (_
          (let* ((commit-id (majjic-revision-commit-id record))
                 (expanded (member commit-id expanded-commit-ids)))
            (magit-insert-section (majjic-revision-section commit-id nil
                                                           :change-id (majjic-revision-change-id record))
-             (magit-insert-heading (majjic--revision-heading-text record))
+             (magit-insert-heading
+              (majjic--top-level-row-text (majjic--revision-heading-text record)))
              (when-let* ((summary (majjic-revision-summary record)))
                (magit-insert-section (majjic-summary-section commit-id (not expanded))
-                 (magit-insert-heading (majjic--ansi-colorize summary))
+                 (magit-insert-heading
+                  (majjic--top-level-row-text (majjic--ansi-colorize summary)))
                  (magit-insert-section-body
                    (majjic--insert-file-summary commit-id expanded-file-keys)))))))))))
+
+(defun majjic--top-level-row-text (text)
+  "Prefix top-level log TEXT with a reserved mark gutter."
+  (concat "  " text))
 
 (defun majjic--insert-message (message)
   "Insert MESSAGE as plain buffer contents."
@@ -309,8 +319,9 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
   (when (and majjic-rebase-mode
              majjic--rebase-state
              (bound-and-true-p magit-root-section))
-    (let ((moved-change-ids (or (majjic-rebase-state-moved-change-ids majjic--rebase-state)
-                                (list (majjic-rebase-state-source-change-id majjic--rebase-state)))))
+    (let* ((source (majjic-rebase-state-source-change-id majjic--rebase-state))
+           (moved-change-ids (or (majjic-rebase-state-moved-change-ids majjic--rebase-state)
+                                 (if (listp source) source (list source)))))
       (dolist (revision (oref magit-root-section children))
         (when (and (object-of-class-p revision 'majjic-revision-section)
                    (majjic--revision-section-moved-p revision moved-change-ids))
@@ -351,16 +362,25 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
   "Add the target summary overlay to SECTION for SOURCE, TARGET, and TARGET-MODE.
 SOURCE-MODE controls whether the summary says revision or descendants."
   (when (and source target (markerp (oref section start)) (markerp (oref section content)))
-    (let* ((label (majjic--rebase-target-mode-label target-mode))
+    (let* ((sources (if (listp source) source (list source)))
+           (label (majjic--rebase-target-mode-label target-mode))
            (prefix (majjic--rebase-target-summary-prefix section target-mode))
-           (source-text (if (eq source-mode 'descendants)
-                            "rebase itself and descendants of "
-                          "rebase revision "))
+           (multi-source (> (length sources) 1))
+           (source-text (cond
+                         (multi-source
+                          (if (eq source-mode 'descendants)
+                              (format "rebase %d revisions and descendants" (length sources))
+                            (format "rebase %d revisions" (length sources))))
+                         ((eq source-mode 'descendants)
+                          "rebase itself and descendants of ")
+                         (t "rebase revision ")))
            (summary (concat (propertize (format "<< %s >>" label)
                                         'face '(:inherit shadow :weight bold))
                             " "
                             (propertize source-text 'face 'shadow)
-                            (propertize (majjic--short-id source) 'face 'font-lock-keyword-face)
+                            (unless multi-source
+                              (propertize (majjic--short-id (car sources))
+                                          'face 'font-lock-keyword-face))
                             " "
                             (propertize label 'face 'shadow)
                             " "

@@ -274,25 +274,40 @@ LIMIT defaults to 1."
 
 (defun majjic--rebase-moved-change-ids (source-change-id source-mode)
   "Return change ids moved by rebasing SOURCE-CHANGE-ID in SOURCE-MODE."
-  (if (eq source-mode 'descendants)
-      (seq-remove #'string-empty-p
-                  (split-string
-                   (string-trim
-                    (majjic--call-jj majjic--repo-root "log"
-                                     "-r" (format "(%s)::" source-change-id)
-                                     "--no-graph" "--color" "never"
-                                     "--template" "change_id ++ \"\\n\""
-                                     "--ignore-working-copy" "--no-pager"))
-                   "\n" t))
-    (list source-change-id)))
+  (let ((sources (cond
+                  ((null source-change-id) nil)
+                  ((listp source-change-id) source-change-id)
+                  (t (list source-change-id)))))
+    (if (eq source-mode 'descendants)
+        (cl-remove-duplicates
+         (apply #'append
+                (mapcar (lambda (source)
+                          (seq-remove #'string-empty-p
+                                      (split-string
+                                       (string-trim
+                                        (majjic--call-jj majjic--repo-root "log"
+                                                         "-r" (format "(%s)::" source)
+                                                         "--no-graph" "--color" "never"
+                                                         "--template" "change_id ++ \"\\n\""
+                                                         "--ignore-working-copy" "--no-pager"))
+                                       "\n" t)))
+                        sources))
+         :test #'equal)
+      sources)))
 
 (defun majjic--rebase-args (source target target-mode &optional source-mode)
   "Return `jj rebase' arguments for SOURCE onto/after/before TARGET.
 TARGET-MODE is one of `onto', `after', or `before'.
 SOURCE-MODE is one of `revision' or `descendants', defaulting to `revision'."
-  (append (list "rebase"
-                (if (eq source-mode 'descendants) "--source" "--revisions")
-                source)
+  (append (list "rebase")
+          (apply #'append
+                 (mapcar (lambda (source-id)
+                           (list (if (eq source-mode 'descendants) "--source" "--revisions")
+                                 source-id))
+                         (cond
+                          ((null source) nil)
+                          ((listp source) source)
+                          (t (list source)))))
           (pcase target-mode
             ('after (list "--insert-after" target))
             ('before (list "--insert-before" target))

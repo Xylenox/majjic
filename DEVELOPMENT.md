@@ -12,12 +12,16 @@ Minimal Emacs UI for browsing `jj log`.
 - `RET` on a file visits the working-tree file for `@`, or the unique parent when `@` is empty; older revisions open a read-only snapshot.
 - `RET` on a hunk header or hunk line jumps to the corresponding location; removed lines open the old-side snapshot read-only.
 - `n` / `p` use visible-section motion; from revision headings they skip the auxiliary summary/elided/connector rows, but still descend into expanded file sections; `M-n` / `M-p` move among siblings; `^` jumps to the parent section.
-- `N` creates a new child of the current revision and lands on `@`.
+- `N` creates a new child of the marked revisions, or the current revision if none are marked, and lands on `@`.
 - `e` edits the current revision and lands on `@`.
-- `a` enters abandon mode; `SPC` toggles the current revision, `RET` applies, and `C-g` cancels.
-- `r` enters rebase mode; `o` / `a` / `b` choose onto / after / before, `RET` applies, and `C-g` cancels.
+- `SPC` toggles a persistent mark on the current revision and moves to the next revision.
+- `M` clears all marks.
+- `a` abandons the currently marked revisions after confirmation.
+- `r` enters rebase mode using marked revisions as the source, or the current revision if none are marked; `o` / `a` / `b` choose onto / after / before, `RET` applies, and `C-g` cancels.
 - `u` undoes the latest operation after confirming a full op-log peek.
 - `U` redoes the latest undone operation after confirming a full op-log peek.
+- `O` is reserved for a dedicated op-log browser.
+- `B` is reserved for a dedicated bookmark browser.
 - `g` refreshes.
 
 ## Loading

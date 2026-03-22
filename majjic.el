@@ -56,6 +56,12 @@ When nil, do not pass a limit to `jj log'."
 (defvar-local majjic--mutation-in-progress nil
   "Non-nil while a mutating Jujutsu command is running in this buffer.")
 
+(defvar-local majjic--marked-change-ids nil
+  "List of change ids marked in the current log buffer.")
+
+(defvar-local majjic--mark-overlays nil
+  "Overlays used to display persistent revision marks.")
+
 (defvar-local majjic--abandon-selected-commit-ids nil
   "List of commit ids selected in abandon mode.")
 
@@ -93,6 +99,11 @@ When nil, do not pass a limit to `jj log'."
 (defface majjic-abandon-included-row
   '((t :inherit shadow :strike-through t))
   "Face for revisions included in abandon mode."
+  :group 'majjic)
+
+(defface majjic-marked-row
+  '((t :inherit (error bold)))
+  "Face for persistent marks in the main Majjic log."
   :group 'majjic)
 
 (defclass majjic-revision-section (magit-section)
@@ -137,6 +148,9 @@ When nil, do not pass a limit to `jj log'."
   "^" #'majjic-section-up
   "N" #'majjic-new
   "e" #'majjic-edit
+  "M" #'majjic-clear-marks
+  "O" #'majjic-op-log-browser
+  "B" #'majjic-bookmark-browser
   "a" #'majjic-abandon-start
   "r" #'majjic-rebase-start
   "u" #'majjic-undo
@@ -148,17 +162,6 @@ When nil, do not pass a limit to `jj log'."
   "g" #'majjic-log-refresh)
 
 (define-key majjic-section-map [32] #'majjic-space)
-
-(defvar-keymap majjic-abandon-mode-map
-  "SPC" #'majjic-abandon-toggle-revision
-  "a" #'majjic-abandon-start
-  "RET" #'majjic-abandon-apply
-  "<return>" #'majjic-abandon-apply
-  "C-g" #'majjic-abandon-cancel)
-
-(define-key majjic-abandon-mode-map " " #'majjic-abandon-toggle-revision)
-(define-key majjic-abandon-mode-map [remap scroll-up-command]
-            #'majjic-abandon-toggle-revision)
 
 (defvar-keymap majjic-rebase-mode-map
   "o" #'majjic-rebase-set-onto
@@ -192,6 +195,7 @@ When nil, do not pass a limit to `jj log'."
   (setq-local revert-buffer-function #'majjic--revert-buffer)
   (setq-local truncate-lines t)
   (add-hook 'post-command-hook #'majjic--update-selected-hunk-heading nil t)
+  (add-hook 'post-command-hook #'majjic--sync-mark-overlays nil t)
   (add-hook 'post-command-hook #'majjic--sync-rebase-overlays nil t))
 
 (defvar-keymap majjic-snapshot-mode-map
@@ -202,18 +206,6 @@ When nil, do not pass a limit to `jj log'."
   "Major mode for read-only `majjic' snapshot buffers.
 \\<majjic-snapshot-mode-map>\\[quit-window] closes the temporary snapshot window."
   :group 'majjic)
-
-(define-minor-mode majjic-abandon-mode
-  "Minor mode for staging `jj abandon' selections in a `majjic' log buffer."
-  :lighter " Abandon"
-  :keymap majjic-abandon-mode-map
-  (unless (derived-mode-p 'majjic-log-mode)
-    (setq majjic-abandon-mode nil)
-    (user-error "Not in a majjic log buffer"))
-  (unless majjic-abandon-mode
-    (setq majjic--abandon-selected-commit-ids nil)
-    (majjic--clear-abandon-overlays))
-  (force-mode-line-update))
 
 (define-minor-mode majjic-rebase-mode
   "Minor mode for staging a `jj rebase' interactively in a `majjic' log buffer."
@@ -233,6 +225,9 @@ When nil, do not pass a limit to `jj log'."
 (keymap-set majjic-log-mode-map "^" #'majjic-section-up)
 (keymap-set majjic-log-mode-map "N" #'majjic-new)
 (keymap-set majjic-log-mode-map "e" #'majjic-edit)
+(keymap-set majjic-log-mode-map "M" #'majjic-clear-marks)
+(keymap-set majjic-log-mode-map "O" #'majjic-op-log-browser)
+(keymap-set majjic-log-mode-map "B" #'majjic-bookmark-browser)
 (keymap-set majjic-log-mode-map "a" #'majjic-abandon-start)
 (keymap-set majjic-log-mode-map "r" #'majjic-rebase-start)
 (keymap-set majjic-log-mode-map "u" #'majjic-undo)
@@ -244,13 +239,21 @@ When nil, do not pass a limit to `jj log'."
 (keymap-set majjic-log-mode-map "g" #'majjic-log-refresh)
 
 (defun majjic-space ()
-  "In abandon mode toggle the revision at point, otherwise scroll up.
+  "Toggle a persistent mark at point.
+If point is on a revision heading, move to the next revision afterward.
 This is bound on section keymaps so it wins over inherited Magit
 section bindings that would otherwise page the buffer."
   (interactive)
-  (if majjic-abandon-mode
-      (majjic-abandon-toggle-revision)
-    (call-interactively #'scroll-up-command)))
+  (let* ((section (or (magit-current-section)
+                      (user-error "No section selected")))
+         (revision (or (majjic--current-revision-section)
+                       (user-error "No revision selected")))
+         (advancep (object-of-class-p section 'majjic-revision-section)))
+    (majjic-toggle-mark)
+    (when advancep
+      (when-let* ((next (majjic--next-revision-section revision)))
+        (magit-section-goto next)))
+    (majjic--sync-mark-overlays)))
 
 (defun majjic (&optional directory)
   "Open a Jujutsu log buffer for the current repository.
@@ -286,23 +289,20 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
   (majjic--log-refresh-sync (majjic--capture-refresh-state)))
 
 (defun majjic-new ()
-  "Create a new child of the current revision and move to `@'."
+  "Create a new child of marked revisions, or current revision, and move to `@'."
   (interactive)
-  (when majjic-abandon-mode
-    (majjic-abandon-disabled-command))
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
-  (let ((commit-id (majjic--require-current-commit-id)))
+  (let ((parent-ids (or (majjic--marked-visible-commit-ids)
+                        (list (majjic--require-current-commit-id)))))
     (majjic--run-mutation
      (lambda ()
-       (majjic--call-jj majjic--repo-root "new" commit-id))
+       (apply #'majjic--call-jj majjic--repo-root (cons "new" parent-ids)))
      :target #'majjic--working-copy-commit-id)))
 
 (defun majjic-edit ()
   "Edit the current revision and move to `@'."
   (interactive)
-  (when majjic-abandon-mode
-    (majjic-abandon-disabled-command))
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
   (let ((commit-id (majjic--require-current-commit-id)))
@@ -314,8 +314,6 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
 (defun majjic-undo ()
   "Undo the latest Jujutsu operation after confirmation."
   (interactive)
-  (when majjic-abandon-mode
-    (majjic-abandon-disabled-command))
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
   (majjic--run-confirmed-op-mutation
@@ -326,8 +324,6 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
 (defun majjic-redo ()
   "Redo the latest undone Jujutsu operation after confirmation."
   (interactive)
-  (when majjic-abandon-mode
-    (majjic-abandon-disabled-command))
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
   (majjic--run-confirmed-op-mutation
@@ -336,64 +332,52 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
      (apply #'majjic--call-jj majjic--repo-root (majjic--redo-args)))))
 
 (defun majjic-abandon-start ()
-  "Enter abandon mode with no revisions selected yet."
+  "Abandon marked visible revisions after confirmation.
+Temporarily apply strike-through rendering while the confirmation prompt is
+open.  If rebase mode is active, keep using `a' for rebase-after instead."
   (interactive)
   (if majjic-rebase-mode
       (majjic-rebase-set-after)
-    (when majjic-abandon-mode
-      (user-error "Already in abandon mode"))
-    (setq majjic--abandon-selected-commit-ids nil)
-    (majjic-abandon-mode 1)
-    (message "Abandon mode: SPC toggle, RET apply, C-g cancel")))
-
-(defun majjic-abandon-toggle-revision ()
-  "Toggle direct abandon selection for the current revision."
-  (interactive)
-  (majjic--abandon-toggle-current))
-
-(defun majjic-abandon-apply ()
-  "Apply the current abandon selection."
-  (interactive)
-  (unless majjic-abandon-mode
-    (user-error "Not in abandon mode"))
-  (let* ((selected-ids majjic--abandon-selected-commit-ids)
-         (fallbacks (majjic--selection-fallbacks (majjic--current-commit-id))))
-    (when (null selected-ids)
-      (user-error "No revisions selected for abandon"))
-    (majjic--run-mutation
-     (lambda ()
-       (apply #'majjic--call-jj majjic--repo-root
-              (append (list "abandon" "--retain-bookmarks")
-                      (majjic--prefixed-rev-args selected-ids))))
-     :after-success (lambda ()
-                      (majjic-abandon-mode -1))
-     :target (lambda ()
-               (or (seq-find #'majjic--revision-exists-p fallbacks)
-                   (majjic--working-copy-commit-id))))))
-
-(defun majjic-abandon-cancel ()
-  "Cancel abandon mode without mutating the repository."
-  (interactive)
-  (unless majjic-abandon-mode
-    (user-error "Not in abandon mode"))
-  (majjic-abandon-mode -1)
-  (message "Abandon canceled"))
-
-(defun majjic-abandon-disabled-command ()
-  "Reject commands that are unavailable while staging abandon selections."
-  (interactive)
-  (user-error "Disabled in abandon mode"))
+    (let* ((selected-ids (majjic--marked-visible-commit-ids))
+           (count (length selected-ids))
+           (fallbacks (majjic--selection-fallbacks (majjic--current-commit-id))))
+      (when (zerop count)
+        (user-error "No marked revisions to abandon"))
+      (unwind-protect
+          (progn
+            (setq majjic--abandon-selected-commit-ids selected-ids)
+            (majjic--clear-mark-overlays)
+            (majjic--sync-abandon-overlays)
+            (when (y-or-n-p (format "Abandon %d marked revision%s? "
+                                    count (if (= count 1) "" "s")))
+              (setq majjic--abandon-selected-commit-ids nil)
+              (majjic--clear-abandon-overlays)
+              (majjic--run-mutation
+               (lambda ()
+                 (apply #'majjic--call-jj majjic--repo-root
+                        (append (list "abandon" "--retain-bookmarks")
+                                (majjic--prefixed-rev-args selected-ids))))
+               :target (lambda ()
+                         (or (seq-find #'majjic--revision-exists-p fallbacks)
+                             (majjic--working-copy-commit-id))))))
+        (setq majjic--abandon-selected-commit-ids nil)
+        (majjic--clear-abandon-overlays)
+        (majjic--sync-mark-overlays)))))
 
 (defun majjic-rebase-start ()
   "Enter rebase mode using the current revision as the source.
 When already in rebase mode, switch the source back to a single revision."
   (interactive)
-  (when majjic-abandon-mode
-    (majjic-abandon-disabled-command))
   (if majjic-rebase-mode
       (majjic-rebase-set-source-revision)
-    (let ((source-change-id (majjic--change-id-for-commit-id
-                             (majjic--require-current-commit-id))))
+    (let* ((visible-marked (majjic--marked-visible-change-ids))
+           (source-change-id
+            (cond
+             ((null visible-marked)
+              (majjic--change-id-for-commit-id (majjic--require-current-commit-id)))
+             ((= (length visible-marked) 1)
+              (car visible-marked))
+             (t visible-marked))))
       (setq majjic--rebase-state
             (make-majjic-rebase-state
              :source-change-id source-change-id
@@ -402,6 +386,43 @@ When already in rebase mode, switch the source back to a single revision."
              :target-mode 'onto))
       (majjic-rebase-mode 1)
       (message "Rebase mode: r revision, s descendants, o onto, a after, b before, RET apply, C-g cancel"))))
+
+(defun majjic-toggle-mark ()
+  "Toggle a persistent mark on the current revision."
+  (interactive)
+  (let* ((revision (or (majjic--current-revision-section)
+                       (user-error "No revision selected")))
+         (change-id (oref revision change-id)))
+    (unless change-id
+      (user-error "No revision selected"))
+    (setq majjic--marked-change-ids
+          (if (member change-id majjic--marked-change-ids)
+              (cl-remove change-id majjic--marked-change-ids :test #'equal)
+            (cons change-id majjic--marked-change-ids)))
+    (majjic--restyle-marked-revision revision)
+    (majjic--refresh-rebase-source-from-marks)
+    (message "%s mark"
+             (if (member change-id majjic--marked-change-ids) "Added" "Removed"))))
+
+(defun majjic-clear-marks ()
+  "Clear all persistent marks in the current log buffer."
+  (interactive)
+  (setq majjic--marked-change-ids nil)
+  (majjic--clear-mark-overlays)
+  (majjic--refresh-rebase-source-from-marks)
+  (message "Cleared marks"))
+
+(defun majjic-op-log-browser ()
+  "Open the dedicated operation log browser.
+This keybinding is reserved; the browser itself is not implemented yet."
+  (interactive)
+  (user-error "Op-log browser is not implemented yet"))
+
+(defun majjic-bookmark-browser ()
+  "Open the dedicated bookmark browser.
+This keybinding is reserved; the browser itself is not implemented yet."
+  (interactive)
+  (user-error "Bookmark browser is not implemented yet"))
 
 (defun majjic-rebase-set-onto ()
   "Set the rebase target placement to onto."
@@ -434,15 +455,13 @@ When already in rebase mode, switch the source back to a single revision."
   (unless majjic-rebase-mode
     (user-error "Not in rebase mode"))
   (let* ((source (majjic-rebase-state-source-change-id majjic--rebase-state))
+         (sources (majjic--rebase-source-change-ids source))
          (target (majjic--require-current-commit-id))
          (target-change-id (majjic--change-id-for-commit-id target))
          (source-mode (majjic-rebase-state-source-mode majjic--rebase-state))
          (moved-change-ids (majjic-rebase-state-moved-change-ids majjic--rebase-state))
          (target-mode (majjic-rebase-state-target-mode majjic--rebase-state)))
-    (when (equal source target-change-id)
-      (user-error "Rebase source and target are the same revision"))
-    (when (and (eq source-mode 'descendants)
-               (member target-change-id moved-change-ids))
+    (when (member target-change-id moved-change-ids)
       (user-error "Rebase target is inside moved revisions"))
     (majjic--run-mutation
      (lambda ()
@@ -451,7 +470,7 @@ When already in rebase mode, switch the source back to a single revision."
      :after-success (lambda ()
                       (majjic-rebase-mode -1))
      :target (lambda ()
-               (or (majjic--commit-id-for-change-id source)
+               (or (majjic--commit-id-for-change-id (car sources))
                    (majjic--working-copy-commit-id))))))
 
 (defun majjic-rebase-cancel ()
@@ -655,10 +674,7 @@ toggle that section's body."
       (when (and (object-of-class-p section 'majjic-hunk-section)
                  (oref section hidden))
         (majjic--prepare-missing-hunk-body section))
-      (magit-section-toggle section)
-      (when-let* ((revision (and majjic-abandon-mode (majjic--current-revision-section)))
-                  (commit-id (oref revision value)))
-        (majjic--restyle-abandon-revision revision commit-id)))
+      (magit-section-toggle section))
      ((object-of-class-p section 'majjic-rename-section)
       (user-error "Rename rows do not expand yet"))
      (t
@@ -667,8 +683,6 @@ toggle that section's body."
         (unless summary
           (user-error "No section to toggle at point"))
         (magit-section-toggle summary)
-        (when majjic-abandon-mode
-          (majjic--restyle-abandon-revision revision (oref revision value)))
         (magit-section-goto revision))))))
 
 (defun majjic-visit-file ()
@@ -724,7 +738,7 @@ Follow Magit's naming style with a repo-specific buffer when possible."
    :current-commit-id (majjic--current-commit-id)
    :expanded-commit-ids (majjic--expanded-commit-ids)
    :expanded-file-keys (majjic--expanded-file-keys)
-   :abandon-selected-commit-ids majjic--abandon-selected-commit-ids
+   :marked-change-ids majjic--marked-change-ids
    :rebase-state majjic--rebase-state))
 
 (defun majjic--log-refresh-sync (state)
@@ -738,7 +752,8 @@ Follow Magit's naming style with a repo-specific buffer when possible."
 
 (defun majjic--render-records (records state)
   "Render RECORDS and restore UI STATE."
-  (setq majjic--abandon-selected-commit-ids (majjic-state-abandon-selected-commit-ids state))
+  (setq majjic--marked-change-ids (majjic-state-marked-change-ids state))
+  (setq majjic--abandon-selected-commit-ids nil)
   (setq majjic--rebase-state (majjic-state-rebase-state state))
   (when majjic--rebase-state
     (setf (majjic-rebase-state-moved-change-ids majjic--rebase-state)
@@ -755,7 +770,7 @@ Follow Magit's naming style with a repo-specific buffer when possible."
           (goto-char (point-min))
           (when (magit-section-at)
             (magit-section-goto (magit-section-at))))
-        (majjic--sync-abandon-overlays)
+        (majjic--sync-mark-overlays)
         (majjic--sync-rebase-overlays))
     (majjic--insert-message "No revisions to show.")))
 
@@ -772,18 +787,6 @@ Follow Magit's naming style with a repo-specific buffer when possible."
           (push (oref child value) ids))))
     (nreverse ids)))
 
-(defun majjic--abandon-toggle-current ()
-  "Toggle current revision in the abandon selection."
-  (unless majjic-abandon-mode
-    (user-error "Not in abandon mode"))
-  (let ((commit-id (majjic--require-current-commit-id))
-        (revision (majjic--current-revision-section)))
-    (setq majjic--abandon-selected-commit-ids
-          (if (member commit-id majjic--abandon-selected-commit-ids)
-              (cl-remove commit-id majjic--abandon-selected-commit-ids :test #'equal)
-            (cons commit-id majjic--abandon-selected-commit-ids)))
-    (majjic--restyle-abandon-revision revision commit-id)))
-
 (defun majjic--restyle-abandon-revision (revision commit-id)
   "Update abandon styling overlay for REVISION in place."
   (when revision
@@ -797,13 +800,12 @@ Follow Magit's naming style with a repo-specific buffer when possible."
 
 (defun majjic--sync-abandon-overlays ()
   "Rebuild abandon overlays for all selected revisions in the current buffer."
-  (when majjic-abandon-mode
-    (majjic--clear-abandon-overlays)
-    (when (bound-and-true-p magit-root-section)
-      (dolist (revision (oref magit-root-section children))
-        (when (and (object-of-class-p revision 'majjic-revision-section)
-                   (member (oref revision value) majjic--abandon-selected-commit-ids))
-          (majjic--restyle-abandon-revision revision (oref revision value)))))))
+  (majjic--clear-abandon-overlays)
+  (when (bound-and-true-p magit-root-section)
+    (dolist (revision (oref magit-root-section children))
+      (when (and (object-of-class-p revision 'majjic-revision-section)
+                 (member (oref revision value) majjic--abandon-selected-commit-ids))
+        (majjic--restyle-abandon-revision revision (oref revision value))))))
 
 (defun majjic--delete-abandon-overlay (commit-id)
   "Delete the abandon overlay for COMMIT-ID, if present."
@@ -818,6 +820,100 @@ Follow Magit's naming style with a repo-specific buffer when possible."
   "Remove all abandon styling overlays from the current buffer."
   (mapc #'delete-overlay majjic--abandon-overlays)
   (setq majjic--abandon-overlays nil))
+
+(defun majjic--marked-visible-commit-ids ()
+  "Return visible commit ids corresponding to persistent marked change ids."
+  (let (ids)
+    (when (bound-and-true-p magit-root-section)
+      (dolist (revision (oref magit-root-section children))
+        (when (and (object-of-class-p revision 'majjic-revision-section)
+                   (member (oref revision change-id) majjic--marked-change-ids))
+          (push (oref revision value) ids))))
+    (nreverse ids)))
+
+(defun majjic--marked-visible-change-ids ()
+  "Return visible marked change ids in buffer order."
+  (let (ids)
+    (when (bound-and-true-p magit-root-section)
+      (dolist (revision (oref magit-root-section children))
+        (when (and (object-of-class-p revision 'majjic-revision-section)
+                   (member (oref revision change-id) majjic--marked-change-ids))
+          (push (oref revision change-id) ids))))
+    (nreverse ids)))
+
+(defun majjic--rebase-source-change-ids (source)
+  "Normalize SOURCE to a list of change ids."
+  (cond
+   ((null source) nil)
+   ((listp source) source)
+   (t (list source))))
+
+(defun majjic--refresh-rebase-source-from-marks ()
+  "If rebase mode is active, refresh the source set from visible marks.
+When there are no visible marks, keep the current staged source unchanged."
+  (when (and majjic-rebase-mode majjic--rebase-state)
+    (when-let* ((visible-marked (majjic--marked-visible-change-ids)))
+      (setf (majjic-rebase-state-source-change-id majjic--rebase-state)
+            (if (= (length visible-marked) 1)
+                (car visible-marked)
+              visible-marked))
+      (setf (majjic-rebase-state-moved-change-ids majjic--rebase-state)
+            (majjic--rebase-moved-change-ids
+             (majjic-rebase-state-source-change-id majjic--rebase-state)
+             (or (majjic-rebase-state-source-mode majjic--rebase-state) 'revision)))
+      (majjic--sync-rebase-overlays))))
+
+(defun majjic--sync-mark-overlays ()
+  "Rebuild persistent mark overlays for visible marked revisions."
+  (majjic--clear-mark-overlays)
+  (when (bound-and-true-p magit-root-section)
+    (dolist (revision (oref magit-root-section children))
+      (when (and (object-of-class-p revision 'majjic-revision-section)
+                 (member (oref revision change-id) majjic--marked-change-ids))
+        (majjic--restyle-marked-revision revision)))))
+
+(defun majjic--restyle-marked-revision (revision)
+  "Update the persistent mark overlay for REVISION in place."
+  (when revision
+    (let* ((change-id (oref revision change-id))
+           (pos (save-excursion
+                  (magit-section-goto revision)
+                  (line-beginning-position))))
+      (majjic--delete-mark-overlay change-id)
+      (when (member change-id majjic--marked-change-ids)
+        (let* ((selected-revision (magit-current-section))
+               (selectedp (eq revision selected-revision))
+               (display-face (if selectedp
+                                 '(:inherit (majjic-marked-row magit-section-highlight))
+                               'majjic-marked-row))
+               (overlay (make-overlay pos (min (point-max) (1+ pos)) nil t t)))
+          (overlay-put overlay 'display
+                       (propertize "*" 'face display-face))
+          (overlay-put overlay 'priority 1002)
+          (overlay-put overlay 'evaporate t)
+          (overlay-put overlay 'majjic-mark-change-id change-id)
+          (push overlay majjic--mark-overlays))))))
+
+(defun majjic--delete-mark-overlay (change-id)
+  "Delete the persistent mark overlay for CHANGE-ID, if present."
+  (setq majjic--mark-overlays
+        (cl-remove-if (lambda (overlay)
+                        (when (equal (overlay-get overlay 'majjic-mark-change-id) change-id)
+                          (delete-overlay overlay)
+                          t))
+                      majjic--mark-overlays)))
+
+(defun majjic--clear-mark-overlays ()
+  "Remove all persistent mark overlays from the current buffer."
+  (mapc #'delete-overlay majjic--mark-overlays)
+  (setq majjic--mark-overlays nil))
+
+(defun majjic--next-revision-section (section)
+  "Return the next revision sibling after SECTION, skipping auxiliary rows."
+  (let ((next (majjic--next-top-level-section section)))
+    (while (and next (not (object-of-class-p next 'majjic-revision-section)))
+      (setq next (majjic--next-top-level-section next)))
+    next))
 
 (defun majjic--expanded-commit-ids ()
   "Return commit ids whose file sections are currently expanded."

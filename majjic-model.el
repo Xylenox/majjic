@@ -22,7 +22,7 @@
   current-commit-id
   expanded-commit-ids
   expanded-file-keys
-  abandon-selected-commit-ids
+  marked-change-ids
   rebase-state)
 
 (cl-defstruct majjic-rebase-state
