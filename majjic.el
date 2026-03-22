@@ -248,11 +248,24 @@ section bindings that would otherwise page the buffer."
       (majjic-abandon-toggle-revision)
     (call-interactively #'scroll-up-command)))
 
-(defun majjic ()
-  "Open a Jujutsu log buffer for the current repository."
+(defun majjic (&optional directory)
+  "Open a Jujutsu log buffer for the current repository.
+When DIRECTORY is non-nil, start repository discovery there.
+If the current directory is not inside a Jujutsu repository, prompt for one."
   (interactive)
-  (let* ((source-dir default-directory)
-         (repo-root (majjic--locate-root source-dir))
+  (let* ((source-dir (file-name-as-directory (expand-file-name (or directory default-directory))))
+         (repo-root (or (majjic--locate-root source-dir)
+                        (let* ((picked-dir
+                                (file-name-as-directory
+                                 (expand-file-name
+                                  (read-directory-name "Open Jujutsu repository: "
+                                                       source-dir nil t))))
+                               (picked-root (majjic--locate-root picked-dir)))
+                          (unless picked-root
+                            (user-error "Not inside a Jujutsu repository: %s"
+                                        (abbreviate-file-name picked-dir)))
+                          (setq source-dir picked-dir)
+                          picked-root)))
          (buffer (get-buffer-create (majjic--log-buffer-name repo-root))))
     (with-current-buffer buffer
       (majjic-log-mode)
