@@ -429,7 +429,7 @@ gap above the selected row."
                     collect (if alive ?│ ?\s)))))
 
 (defun majjic--line-gutter-text (width)
-  "Return WIDTH characters of gutter text from the current line, padded with spaces."
+  "Return WIDTH chars of current-line gutter text, padded with spaces."
   (let* ((text (buffer-substring-no-properties (line-beginning-position) (line-end-position)))
          (gutter (substring text 0 (min width (length text)))))
     (concat gutter (make-string (max 0 (- width (length gutter))) ?\s))))

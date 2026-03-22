@@ -18,4 +18,6 @@ https://github.com/user-attachments/assets/9da48e9c-72da-463d-91a3-b97fefcf597d
 - `e` edit the current revision and move to `@`
 - `a` enter abandon mode; in abandon mode, `SPC` toggles a revision, `RET` applies, and `C-g` cancels
 - `r` enter rebase mode; in rebase mode, `o` / `a` / `b` choose onto / after / before, `RET` applies, and `C-g` cancels
+- `u` undo the latest operation after confirming a full op-log peek
+- `U` redo the latest undone operation after confirming a full op-log peek
 - `g` refresh

@@ -24,6 +24,18 @@
 (declare-function majjic--parse-log-output "majjic-model")
 (declare-function majjic--revision-commit-ids "majjic")
 
+(cl-defstruct (majjic-operation-record
+               (:constructor majjic--make-operation-record))
+  id
+  description
+  parent-ids)
+
+(defconst majjic--undo-op-desc-prefix "undo: restore to operation "
+  "Prefix used by `jj undo' operation descriptions.")
+
+(defconst majjic--redo-op-desc-prefix "redo: restore to operation "
+  "Prefix used by `jj redo' operation descriptions.")
+
 (defun majjic--read-log-records ()
   "Return parsed revision records for the current buffer's repository."
   (unless majjic--repo-root
@@ -152,6 +164,113 @@ Keyword args:
 (defun majjic--prefixed-rev-args (commit-ids)
   "Return `-r' args for COMMIT-IDS."
   (cl-mapcan (lambda (commit-id) (list "-r" commit-id)) commit-ids))
+
+(defun majjic--undo-args ()
+  "Return `jj undo' arguments."
+  '("undo"))
+
+(defun majjic--redo-args ()
+  "Return `jj redo' arguments."
+  '("redo"))
+
+(defun majjic--op-log-preview (&optional limit)
+  "Return the latest operation log text for confirmation preview.
+LIMIT defaults to 1."
+  (majjic--operation-log-entry "@" t limit))
+
+(defun majjic--operation-log-entry (&optional operation-id color limit)
+  "Return `jj op log' text for OPERATION-ID.
+OPERATION-ID defaults to `@'.  When COLOR is non-nil, preserve ANSI colors.
+LIMIT defaults to 1."
+  (string-trim-right
+   (apply #'majjic--call-jj majjic--repo-root
+          (append
+           (list "--at-op" (or operation-id "@")
+                 "--ignore-working-copy"
+                 "op" "log" "-n" (number-to-string (or limit 1))
+                 "--color" (if color "always" "never")
+                 "--no-pager")))))
+
+(defun majjic--read-operation-record (&optional operation-id)
+  "Return metadata for OPERATION-ID, defaulting to `@'."
+  (let* ((output
+          (string-trim-right
+           (apply #'majjic--call-jj majjic--repo-root
+                  (append
+                   (list "--at-op" (or operation-id "@")
+                         "--ignore-working-copy"
+                         "op" "log" "-n" "1" "--no-graph"
+                         "--color" "never" "--no-pager"
+                         "--template"
+                         "separate(\"\\x1f\", id, description, parents.map(|o| o.id()).join(\",\")) ++ \"\\n\"")))))
+         (fields (split-string output "\x1f")))
+    (majjic--make-operation-record
+     :id (nth 0 fields)
+     :description (or (nth 1 fields) "")
+     :parent-ids (seq-remove #'string-empty-p
+                             (split-string (or (nth 2 fields) "") "," t)))))
+
+(defun majjic--operation-restored-id (operation-record prefix)
+  "Return the operation id restored by OPERATION-RECORD with PREFIX."
+  (when-let* ((id (string-remove-prefix prefix
+                                        (majjic-operation-record-description operation-record))))
+    (unless (equal id (majjic-operation-record-description operation-record))
+      id)))
+
+(defun majjic--synthetic-operation-restored-id (operation-record)
+  "Return the restored operation id if OPERATION-RECORD is synthetic."
+  (or (majjic--operation-restored-id operation-record majjic--undo-op-desc-prefix)
+      (majjic--operation-restored-id operation-record majjic--redo-op-desc-prefix)))
+
+(defun majjic--terminal-non-synthetic-operation-record (operation-record)
+  "Follow synthetic undo/redo links from OPERATION-RECORD to a real operation."
+  (let ((current operation-record)
+        (seen nil)
+        restored-id)
+    (while (setq restored-id (majjic--synthetic-operation-restored-id current))
+      (when (member restored-id seen)
+        (user-error "Operation restore chain has a cycle"))
+      (push restored-id seen)
+      (setq current (majjic--read-operation-record restored-id)))
+    current))
+
+(defun majjic--effective-undo-operation-preview ()
+  "Return preview text describing what `jj undo' will effectively do."
+  (let* ((subject (majjic--read-operation-record))
+         (subject (if (majjic--synthetic-operation-restored-id subject)
+                      (majjic--terminal-non-synthetic-operation-record subject)
+                    subject))
+         (parent-ids (majjic-operation-record-parent-ids subject))
+         (_destination (pcase (length parent-ids)
+                         (0 (user-error "Cannot undo root operation"))
+                         (1 (majjic--read-operation-record (car parent-ids)))
+                         (_ (user-error "Cannot undo a merge operation")))))
+    (string-join
+     (list "Will undo operation:"
+           (majjic--operation-log-entry (majjic-operation-record-id subject) t))
+     "\n")))
+
+(defun majjic--effective-redo-operation-preview ()
+  "Return preview text describing what `jj redo' will effectively do."
+  (let* ((cursor (majjic--read-operation-record))
+         (cursor (if-let* ((restored-id (majjic--operation-restored-id
+                                         cursor majjic--redo-op-desc-prefix)))
+                     (majjic--read-operation-record restored-id)
+                   cursor)))
+    (unless (string-prefix-p majjic--undo-op-desc-prefix
+                             (majjic-operation-record-description cursor))
+      (user-error "Nothing to redo"))
+    (let* ((parent-ids (majjic-operation-record-parent-ids cursor))
+           (destination (if (= (length parent-ids) 1)
+                            (majjic--read-operation-record (car parent-ids))
+                          (user-error "Undo operation should have a single parent")))
+           (subject (if (majjic--synthetic-operation-restored-id destination)
+                        (majjic--terminal-non-synthetic-operation-record destination)
+                      destination)))
+      (string-join
+       (list "Will redo operation:"
+             (majjic--operation-log-entry (majjic-operation-record-id subject) t))
+       "\n"))))
 
 (defun majjic--rebase-args (source target target-mode)
   "Return `jj rebase' arguments for SOURCE onto/after/before TARGET.

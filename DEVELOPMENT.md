@@ -16,6 +16,8 @@ Minimal Emacs UI for browsing `jj log`.
 - `e` edits the current revision and lands on `@`.
 - `a` enters abandon mode; `SPC` toggles the current revision, `RET` applies, and `C-g` cancels.
 - `r` enters rebase mode; `o` / `a` / `b` choose onto / after / before, `RET` applies, and `C-g` cancels.
+- `u` undoes the latest operation after confirming a full op-log peek.
+- `U` redoes the latest undone operation after confirming a full op-log peek.
 - `g` refreshes.
 
 ## Loading

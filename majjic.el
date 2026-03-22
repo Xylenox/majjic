@@ -17,6 +17,7 @@
 
 ;;; Code:
 
+(require 'ansi-color)
 (require 'cl-lib)
 (require 'magit-section)
 (require 'subr-x)
@@ -70,6 +71,9 @@ When nil, do not pass a limit to `jj log'."
 (defvar-local majjic--rebase-overlays nil
   "Overlays used to preview rebase source and target in `majjic-rebase-mode'.")
 
+(defconst majjic--op-preview-max-height 10
+  "Maximum height for the temporary undo/redo operation preview window.")
+
 (require 'majjic-jj)
 (require 'majjic-render)
 (require 'majjic-actions)
@@ -77,8 +81,13 @@ When nil, do not pass a limit to `jj log'."
 (declare-function majjic--clear-rebase-overlays "majjic-render")
 (declare-function majjic--change-id-for-commit-id "majjic-jj")
 (declare-function majjic--commit-id-for-change-id "majjic-jj")
+(declare-function majjic--effective-redo-operation-preview "majjic-jj")
+(declare-function majjic--effective-undo-operation-preview "majjic-jj")
+(declare-function majjic--op-log-preview "majjic-jj")
+(declare-function majjic--redo-args "majjic-jj")
 (declare-function majjic--rebase-target-mode-label "majjic-render")
 (declare-function majjic--sync-rebase-overlays "majjic-render")
+(declare-function majjic--undo-args "majjic-jj")
 
 (defface majjic-abandon-included-row
   '((t :inherit shadow :strike-through t))
@@ -128,6 +137,8 @@ When nil, do not pass a limit to `jj log'."
   "e" #'majjic-edit
   "a" #'majjic-abandon-start
   "r" #'majjic-rebase-start
+  "u" #'majjic-undo
+  "U" #'majjic-redo
   "<wheel-up>" #'majjic-mwheel-scroll
   "<wheel-down>" #'majjic-mwheel-scroll
   "<mouse-4>" #'majjic-mwheel-scroll
@@ -220,6 +231,8 @@ When nil, do not pass a limit to `jj log'."
 (keymap-set majjic-log-mode-map "e" #'majjic-edit)
 (keymap-set majjic-log-mode-map "a" #'majjic-abandon-start)
 (keymap-set majjic-log-mode-map "r" #'majjic-rebase-start)
+(keymap-set majjic-log-mode-map "u" #'majjic-undo)
+(keymap-set majjic-log-mode-map "U" #'majjic-redo)
 (keymap-set majjic-log-mode-map "<wheel-up>" #'majjic-mwheel-scroll)
 (keymap-set majjic-log-mode-map "<wheel-down>" #'majjic-mwheel-scroll)
 (keymap-set majjic-log-mode-map "<mouse-4>" #'majjic-mwheel-scroll)
@@ -280,6 +293,30 @@ section bindings that would otherwise page the buffer."
      (lambda ()
        (majjic--call-jj majjic--repo-root "edit" "-r" commit-id))
      :target #'majjic--working-copy-commit-id)))
+
+(defun majjic-undo ()
+  "Undo the latest Jujutsu operation after confirmation."
+  (interactive)
+  (when majjic-abandon-mode
+    (majjic-abandon-disabled-command))
+  (when majjic-rebase-mode
+    (majjic-rebase-disabled-command))
+  (majjic--run-confirmed-op-mutation
+   "undo"
+   (lambda ()
+     (apply #'majjic--call-jj majjic--repo-root (majjic--undo-args)))))
+
+(defun majjic-redo ()
+  "Redo the latest undone Jujutsu operation after confirmation."
+  (interactive)
+  (when majjic-abandon-mode
+    (majjic-abandon-disabled-command))
+  (when majjic-rebase-mode
+    (majjic-rebase-disabled-command))
+  (majjic--run-confirmed-op-mutation
+   "redo"
+   (lambda ()
+     (apply #'majjic--call-jj majjic--repo-root (majjic--redo-args)))))
 
 (defun majjic-abandon-start ()
   "Enter abandon mode with no revisions selected yet."
@@ -393,6 +430,60 @@ section bindings that would otherwise page the buffer."
   "Reject commands that are unavailable while staging a rebase."
   (interactive)
   (user-error "Disabled in rebase mode"))
+
+(defun majjic--run-confirmed-op-mutation (action thunk)
+  "Preview the latest operation, confirm ACTION, and run mutating THUNK."
+  (let* ((current (majjic--current-change-id))
+         (fallbacks (majjic--selection-fallbacks current)))
+    (when (majjic--confirm-latest-operation action)
+      (majjic--run-mutation
+       thunk
+       :target (lambda ()
+                 (or (and current (majjic--revision-exists-p current) current)
+                     (seq-find #'majjic--revision-exists-p fallbacks)
+                     (majjic--working-copy-commit-id)))))))
+
+(defun majjic--confirm-latest-operation (action)
+  "Show the effective operation preview in a side window and ask to perform ACTION."
+  (let* ((preview (pcase action
+                    ("undo" (majjic--effective-undo-operation-preview))
+                    ("redo" (majjic--effective-redo-operation-preview))
+                    (_ (majjic--op-log-preview))))
+         (buffer (get-buffer-create (format "*majjic %s preview*" action)))
+         (window nil))
+    (unwind-protect
+        (save-selected-window
+          (majjic--prepare-op-preview-buffer buffer preview)
+          (setq window
+                (display-buffer-in-side-window
+                 buffer
+                 `((side . bottom)
+                   (slot . 0)
+                   (window-height . fit-window-to-buffer)
+                   (window-parameters
+                    . ((no-other-window . t)
+                       (no-delete-other-windows . t))))))
+          (when (window-live-p window)
+            (set-window-dedicated-p window t)
+            (fit-window-to-buffer window majjic--op-preview-max-height 3 nil nil t))
+          (y-or-n-p (format "%s latest change? " (capitalize action))))
+      (when (window-live-p window)
+        (quit-window t window))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(defun majjic--prepare-op-preview-buffer (buffer preview)
+  "Populate BUFFER with PREVIEW text and render ANSI colors."
+  (with-current-buffer buffer
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (insert preview)
+      (unless (bolp)
+        (insert "\n"))
+      (ansi-color-apply-on-region (point-min) (point-max)))
+    (goto-char (point-min))
+    (special-mode))
+  buffer)
 
 (defun majjic--rebase-set-target-mode (target-mode)
   "Set TARGET-MODE in the current rebase state."
