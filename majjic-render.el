@@ -18,6 +18,12 @@
 (require 'majjic-model)
 (require 'subr-x)
 
+(declare-function majjic--current-revision-section "majjic-actions")
+(declare-function majjic--commit-id-for-change-id "majjic-jj")
+(defvar majjic--rebase-overlays)
+(defvar majjic--rebase-state)
+(defvar majjic-rebase-mode)
+
 (defun majjic--revision-heading-text (record)
   "Return propertized heading text for revision RECORD."
   (majjic--ansi-colorize (majjic-revision-heading record)))
@@ -290,6 +296,182 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
                     ((eq char ?\t) ?\t)
                     (t ?\s)))
                  (string-to-list prefix))))
+
+(defun majjic--clear-rebase-overlays ()
+  "Remove all transient rebase preview overlays from the current buffer."
+  (mapc #'delete-overlay majjic--rebase-overlays)
+  (setq majjic--rebase-overlays nil))
+
+(defun majjic--sync-rebase-overlays ()
+  "Rebuild rebase preview overlays for the current point and mode state."
+  (majjic--clear-rebase-overlays)
+  (when (and majjic-rebase-mode
+             majjic--rebase-state
+             (bound-and-true-p magit-root-section))
+    (when-let* ((source-section
+                 (majjic--revision-section-by-id
+                  (majjic--commit-id-for-change-id
+                   (majjic-rebase-state-source-change-id majjic--rebase-state)))))
+      (majjic--add-rebase-source-overlay source-section))
+    (when-let* ((target-section (majjic--current-revision-section)))
+      (majjic--add-rebase-target-overlay
+       target-section
+       (majjic-rebase-state-source-change-id majjic--rebase-state)
+       (oref target-section value)
+       (majjic-rebase-state-target-mode majjic--rebase-state)))))
+
+(defun majjic--revision-section-by-id (commit-id)
+  "Return the visible revision section for COMMIT-ID, or nil."
+  (when (and commit-id (bound-and-true-p magit-root-section))
+    (seq-find (lambda (child)
+                (and (object-of-class-p child 'majjic-revision-section)
+                     (equal (oref child value) commit-id)))
+              (oref magit-root-section children))))
+
+(defun majjic--add-rebase-source-overlay (section)
+  "Add the source marker overlay to SECTION."
+  (when (markerp (oref section start))
+    (let ((overlay (majjic--make-rebase-anchor-overlay
+                    (majjic--revision-marker-position section)))
+          (selected (eq section (majjic--current-revision-section))))
+      (overlay-put overlay 'before-string
+                   (propertize "<< move >> "
+                               'face (if selected
+                                         '(:inherit (shadow magit-section-highlight)
+                                           :weight bold)
+                                       '(:inherit shadow :weight bold))))
+      (overlay-put overlay 'priority 1003)
+      (overlay-put overlay 'evaporate t)
+      (push overlay majjic--rebase-overlays))))
+
+(defun majjic--add-rebase-target-overlay (section source target target-mode)
+  "Add the target summary overlay to SECTION for SOURCE, TARGET, and TARGET-MODE."
+  (when (and source target (markerp (oref section start)) (markerp (oref section content)))
+    (let* ((label (majjic--rebase-target-mode-label target-mode))
+           (prefix (majjic--rebase-target-summary-prefix section target-mode))
+           (summary (concat (propertize (format "<< %s >>" label)
+                                        'face '(:inherit shadow :weight bold))
+                            " "
+                            (propertize "rebase revision " 'face 'shadow)
+                            (propertize (majjic--short-change-id source) 'face 'font-lock-keyword-face)
+                            " "
+                            (propertize label 'face 'shadow)
+                            " "
+                            (propertize (majjic--short-change-id target) 'face 'font-lock-keyword-face)
+                            "\n"))
+           (summary-text (concat (propertize prefix 'face 'default) summary))
+           (pos (if (eq target-mode 'before)
+                    (max (oref section start) (1- (oref section end)))
+                  (oref section start)))
+           (overlay (majjic--make-rebase-anchor-overlay pos)))
+      (overlay-put overlay (if (eq target-mode 'before) 'after-string 'before-string)
+                   summary-text)
+      (overlay-put overlay 'priority 1003)
+      (overlay-put overlay 'evaporate t)
+      (push overlay majjic--rebase-overlays))))
+
+(defun majjic--make-rebase-anchor-overlay (pos)
+  "Return a live non-empty overlay anchored at POS for transient rebase text."
+  (make-overlay pos (min (point-max) (1+ pos)) nil t t))
+
+(defun majjic--rebase-target-mode-label (target-mode)
+  "Return display label for TARGET-MODE."
+  (pcase target-mode
+    ('after "after")
+    ('before "before")
+    (_ "onto")))
+
+(defun majjic--short-change-id (commit-id)
+  "Return a compact display form of COMMIT-ID."
+  (if (stringp commit-id)
+      (substring commit-id 0 (min 8 (length commit-id)))
+    ""))
+
+(defun majjic--revision-marker-position (section)
+  "Return the position just after SECTION's graph gutter."
+  (save-excursion
+    (goto-char (oref section start))
+    (let ((line (buffer-substring-no-properties (line-beginning-position)
+                                                (line-end-position))))
+      (+ (line-beginning-position)
+         (if (string-match "\\`[^[:alnum:]]*" line)
+             (match-end 0)
+           0)))))
+
+(defun majjic--rebase-target-summary-prefix (section target-mode)
+  "Return a graph prefix for a transient target summary near SECTION.
+Mirror upstream jjui's gap model: for `before', extend the selected row across
+the gap below it; for `after' and `onto', extend the previous row across the
+gap above the selected row."
+  (let* ((width (length (majjic--heading-gutter-text section)))
+         (source (if (eq target-mode 'before)
+                     section
+                   (majjic--previous-top-level-section section))))
+    (if source
+        (majjic--section-extended-gutter-prefix source width)
+      (make-string width ?\s))))
+
+(defun majjic--section-extended-gutter-prefix (section width)
+  "Return SECTION's branch continuation gutter extended to WIDTH columns."
+  (let ((mask (make-vector width nil)))
+    (save-excursion
+      (goto-char (oref section start))
+      (while (< (point) (oref section end))
+        (let ((gutter (majjic--line-gutter-text width)))
+          (dotimes (i width)
+            (pcase (majjic--graph-extend-state (aref gutter i))
+              ('yes (aset mask i t))
+              ('no (aset mask i nil))
+              ('carry nil))))
+        (forward-line 1)))
+    (apply #'string
+           (cl-loop for alive across mask
+                    collect (if alive ?│ ?\s)))))
+
+(defun majjic--line-gutter-text (width)
+  "Return WIDTH characters of gutter text from the current line, padded with spaces."
+  (let* ((text (buffer-substring-no-properties (line-beginning-position) (line-end-position)))
+         (gutter (substring text 0 (min width (length text)))))
+    (concat gutter (make-string (max 0 (- width (length gutter))) ?\s))))
+
+(defun majjic--graph-extend-state (char)
+  "Return how graph CHAR affects branch continuation across a gap.
+The return value is one of `yes', `no', or `carry', following upstream jjui's
+row extension semantics."
+  (cond
+   ((memq char '(?│ ?| ?╭ ?├ ?┐ ?┤ ?┌ ?╮ ?┬ ?┼ ?+ ?\\ ?.)) 'yes)
+   ((memq char '(?╯ ?╰ ?└ ?┴ ?┘ ?\s ?/)) 'no)
+   ((memq char '(?─ ?-)) 'carry)
+   (t 'no)))
+
+(defun majjic--heading-gutter-text (section)
+  "Return the graph gutter text from SECTION's heading line."
+  (or (when section
+        (save-excursion
+          (goto-char (oref section start))
+          (let ((line (buffer-substring-no-properties (line-beginning-position)
+                                                      (line-end-position))))
+            (when (string-match "\\`\\([^[:alnum:]]*\\)" line)
+              (match-string 1 line)))))
+      ""))
+
+(defun majjic--next-top-level-section (section)
+  "Return the next top-level sibling section after SECTION, or nil."
+  (when-let* ((parent (oref section parent))
+              (siblings (oref parent children)))
+    (cadr (memq section siblings))))
+
+(defun majjic--previous-top-level-section (section)
+  "Return the previous top-level sibling section before SECTION, or nil."
+  (when-let* ((parent (oref section parent))
+              (siblings (oref parent children)))
+    (let ((previous nil))
+      (catch 'found
+        (dolist (sibling siblings)
+          (when (eq sibling section)
+            (throw 'found previous))
+          (setq previous sibling))
+        nil))))
 
 (provide 'majjic-render)
 

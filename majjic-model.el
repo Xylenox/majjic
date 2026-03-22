@@ -22,7 +22,13 @@
   current-change-id
   expanded-change-ids
   expanded-file-keys
-  abandon-selected-ids)
+  abandon-selected-ids
+  rebase-state)
+
+(cl-defstruct majjic-rebase-state
+  "Transient state for `majjic-rebase-mode'."
+  source-change-id
+  target-mode)
 
 (cl-defstruct majjic-revision
   "Parsed revision row from `jj log'."

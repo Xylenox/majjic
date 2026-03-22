@@ -111,6 +111,25 @@ Keyword args:
                    "--ignore-working-copy" "--no-graph"
                    "--color" "never" "--template" "commit_id")))
 
+(defun majjic--change-id-for-commit-id (commit-id)
+  "Return the change id for COMMIT-ID in the current repository view."
+  (string-trim
+   (majjic--call-jj majjic--repo-root "log" "-r" commit-id
+                   "--ignore-working-copy" "--no-graph"
+                   "--color" "never" "--template" "change_id")))
+
+(defun majjic--commit-id-for-change-id (change-id)
+  "Return the current commit id for CHANGE-ID, or nil if it no longer exists."
+  (when change-id
+    (condition-case nil
+        (let ((commit-id (string-trim
+                          (majjic--call-jj majjic--repo-root "log" "-r" change-id
+                                          "--ignore-working-copy" "--no-graph"
+                                          "--color" "never" "--template" "commit_id"))))
+          (unless (string-empty-p commit-id)
+            commit-id))
+      (error nil))))
+
 (defun majjic--revision-exists-p (commit-id)
   "Return non-nil if COMMIT-ID exists in the current repo view."
   (when commit-id
@@ -133,6 +152,15 @@ Keyword args:
 (defun majjic--prefixed-rev-args (commit-ids)
   "Return `-r' args for COMMIT-IDS."
   (cl-mapcan (lambda (commit-id) (list "-r" commit-id)) commit-ids))
+
+(defun majjic--rebase-args (source target target-mode)
+  "Return `jj rebase' arguments for SOURCE onto/after/before TARGET.
+TARGET-MODE is one of `onto', `after', or `before'."
+  (append (list "rebase" "-r" source)
+          (pcase target-mode
+            ('after (list "--insert-after" target))
+            ('before (list "--insert-before" target))
+            (_ (list "--onto" target)))))
 
 (defun majjic--working-tree-commit-p (commit-id)
   "Return non-nil if COMMIT-ID should visit the working-tree file."

@@ -64,9 +64,21 @@ When nil, do not pass a limit to `jj log'."
 (defvar-local majjic--selected-hunk-heading-overlays nil
   "Overlays used to emphasize hunk headers in the selected file section.")
 
+(defvar-local majjic--rebase-state nil
+  "Transient state for `majjic-rebase-mode'.")
+
+(defvar-local majjic--rebase-overlays nil
+  "Overlays used to preview rebase source and target in `majjic-rebase-mode'.")
+
 (require 'majjic-jj)
 (require 'majjic-render)
 (require 'majjic-actions)
+
+(declare-function majjic--clear-rebase-overlays "majjic-render")
+(declare-function majjic--change-id-for-commit-id "majjic-jj")
+(declare-function majjic--commit-id-for-change-id "majjic-jj")
+(declare-function majjic--rebase-target-mode-label "majjic-render")
+(declare-function majjic--sync-rebase-overlays "majjic-render")
 
 (defface majjic-abandon-included-row
   '((t :inherit shadow :strike-through t))
@@ -115,6 +127,7 @@ When nil, do not pass a limit to `jj log'."
   "N" #'majjic-new
   "e" #'majjic-edit
   "a" #'majjic-abandon-start
+  "r" #'majjic-rebase-start
   "<wheel-up>" #'majjic-mwheel-scroll
   "<wheel-down>" #'majjic-mwheel-scroll
   "<mouse-4>" #'majjic-mwheel-scroll
@@ -133,6 +146,14 @@ When nil, do not pass a limit to `jj log'."
 (define-key majjic-abandon-mode-map " " #'majjic-abandon-toggle-revision)
 (define-key majjic-abandon-mode-map [remap scroll-up-command]
             #'majjic-abandon-toggle-revision)
+
+(defvar-keymap majjic-rebase-mode-map
+  "o" #'majjic-rebase-set-onto
+  "a" #'majjic-rebase-set-after
+  "b" #'majjic-rebase-set-before
+  "RET" #'majjic-rebase-apply
+  "<return>" #'majjic-rebase-apply
+  "C-g" #'majjic-rebase-cancel)
 
 (defvar-keymap majjic-revision-section-map
   :parent majjic-section-map)
@@ -155,7 +176,8 @@ When nil, do not pass a limit to `jj log'."
   :group 'majjic
   (setq-local revert-buffer-function #'majjic--revert-buffer)
   (setq-local truncate-lines t)
-  (add-hook 'post-command-hook #'majjic--update-selected-hunk-heading nil t))
+  (add-hook 'post-command-hook #'majjic--update-selected-hunk-heading nil t)
+  (add-hook 'post-command-hook #'majjic--sync-rebase-overlays nil t))
 
 (defvar-keymap majjic-snapshot-mode-map
   :parent special-mode-map
@@ -178,12 +200,26 @@ When nil, do not pass a limit to `jj log'."
     (majjic--clear-abandon-overlays))
   (force-mode-line-update))
 
+(define-minor-mode majjic-rebase-mode
+  "Minor mode for staging a `jj rebase' interactively in a `majjic' log buffer."
+  :lighter " Rebase"
+  :keymap majjic-rebase-mode-map
+  (unless (derived-mode-p 'majjic-log-mode)
+    (setq majjic-rebase-mode nil)
+    (user-error "Not in a majjic log buffer"))
+  (unless majjic-rebase-mode
+    (setq majjic--rebase-state nil)
+    (majjic--clear-rebase-overlays))
+  (majjic--sync-rebase-overlays)
+  (force-mode-line-update))
+
 (keymap-set majjic-log-mode-map "n" #'majjic-section-forward)
 (keymap-set majjic-log-mode-map "p" #'majjic-section-backward)
 (keymap-set majjic-log-mode-map "^" #'majjic-section-up)
 (keymap-set majjic-log-mode-map "N" #'majjic-new)
 (keymap-set majjic-log-mode-map "e" #'majjic-edit)
 (keymap-set majjic-log-mode-map "a" #'majjic-abandon-start)
+(keymap-set majjic-log-mode-map "r" #'majjic-rebase-start)
 (keymap-set majjic-log-mode-map "<wheel-up>" #'majjic-mwheel-scroll)
 (keymap-set majjic-log-mode-map "<wheel-down>" #'majjic-mwheel-scroll)
 (keymap-set majjic-log-mode-map "<mouse-4>" #'majjic-mwheel-scroll)
@@ -224,6 +260,8 @@ section bindings that would otherwise page the buffer."
   (interactive)
   (when majjic-abandon-mode
     (majjic-abandon-disabled-command))
+  (when majjic-rebase-mode
+    (majjic-rebase-disabled-command))
   (let ((commit-id (majjic--require-current-commit-id)))
     (majjic--run-mutation
      (lambda ()
@@ -235,6 +273,8 @@ section bindings that would otherwise page the buffer."
   (interactive)
   (when majjic-abandon-mode
     (majjic-abandon-disabled-command))
+  (when majjic-rebase-mode
+    (majjic-rebase-disabled-command))
   (let ((commit-id (majjic--require-current-commit-id)))
     (majjic--run-mutation
      (lambda ()
@@ -244,11 +284,13 @@ section bindings that would otherwise page the buffer."
 (defun majjic-abandon-start ()
   "Enter abandon mode with no revisions selected yet."
   (interactive)
-  (when majjic-abandon-mode
-    (user-error "Already in abandon mode"))
-  (setq majjic--abandon-selected-ids nil)
-  (majjic-abandon-mode 1)
-  (message "Abandon mode: SPC toggle, RET apply, C-g cancel"))
+  (if majjic-rebase-mode
+      (majjic-rebase-set-after)
+    (when majjic-abandon-mode
+      (user-error "Already in abandon mode"))
+    (setq majjic--abandon-selected-ids nil)
+    (majjic-abandon-mode 1)
+    (message "Abandon mode: SPC toggle, RET apply, C-g cancel")))
 
 (defun majjic-abandon-toggle-revision ()
   "Toggle direct abandon selection for the current revision."
@@ -287,6 +329,78 @@ section bindings that would otherwise page the buffer."
   "Reject commands that are unavailable while staging abandon selections."
   (interactive)
   (user-error "Disabled in abandon mode"))
+
+(defun majjic-rebase-start ()
+  "Enter rebase mode using the current revision as the source."
+  (interactive)
+  (when majjic-abandon-mode
+    (majjic-abandon-disabled-command))
+  (when majjic-rebase-mode
+    (user-error "Already in rebase mode"))
+  (setq majjic--rebase-state
+        (make-majjic-rebase-state
+         :source-change-id (majjic--change-id-for-commit-id
+                            (majjic--require-current-commit-id))
+         :target-mode 'onto))
+  (majjic-rebase-mode 1)
+  (message "Rebase mode: o onto, a after, b before, RET apply, C-g cancel"))
+
+(defun majjic-rebase-set-onto ()
+  "Set the rebase target placement to onto."
+  (interactive)
+  (majjic--rebase-set-target-mode 'onto))
+
+(defun majjic-rebase-set-after ()
+  "Set the rebase target placement to after."
+  (interactive)
+  (majjic--rebase-set-target-mode 'after))
+
+(defun majjic-rebase-set-before ()
+  "Set the rebase target placement to before."
+  (interactive)
+  (majjic--rebase-set-target-mode 'before))
+
+(defun majjic-rebase-apply ()
+  "Apply the staged rebase."
+  (interactive)
+  (unless majjic-rebase-mode
+    (user-error "Not in rebase mode"))
+  (let* ((source (majjic-rebase-state-source-change-id majjic--rebase-state))
+         (target (majjic--require-current-commit-id))
+         (target-change-id (majjic--change-id-for-commit-id target))
+         (target-mode (majjic-rebase-state-target-mode majjic--rebase-state)))
+    (when (equal source target-change-id)
+      (user-error "Rebase source and target are the same revision"))
+    (majjic--run-mutation
+     (lambda ()
+       (apply #'majjic--call-jj majjic--repo-root
+              (majjic--rebase-args source target target-mode)))
+     :after-success (lambda ()
+                      (majjic-rebase-mode -1))
+     :target (lambda ()
+               (or (majjic--commit-id-for-change-id source)
+                   (majjic--working-copy-commit-id))))))
+
+(defun majjic-rebase-cancel ()
+  "Cancel rebase mode without mutating the repository."
+  (interactive)
+  (unless majjic-rebase-mode
+    (user-error "Not in rebase mode"))
+  (majjic-rebase-mode -1)
+  (message "Rebase canceled"))
+
+(defun majjic-rebase-disabled-command ()
+  "Reject commands that are unavailable while staging a rebase."
+  (interactive)
+  (user-error "Disabled in rebase mode"))
+
+(defun majjic--rebase-set-target-mode (target-mode)
+  "Set TARGET-MODE in the current rebase state."
+  (unless majjic-rebase-mode
+    (user-error "Not in rebase mode"))
+  (setf (majjic-rebase-state-target-mode majjic--rebase-state) target-mode)
+  (majjic--sync-rebase-overlays)
+  (message "Rebase target: %s" (majjic--rebase-target-mode-label target-mode)))
 
 (defun majjic-section-forward ()
   "Move to the beginning of the next visible section.
@@ -467,7 +581,8 @@ Follow Magit's naming style with a repo-specific buffer when possible."
    :current-change-id (majjic--current-change-id)
    :expanded-change-ids (majjic--expanded-change-ids)
    :expanded-file-keys (majjic--expanded-file-keys)
-   :abandon-selected-ids majjic--abandon-selected-ids))
+   :abandon-selected-ids majjic--abandon-selected-ids
+   :rebase-state majjic--rebase-state))
 
 (defun majjic--log-refresh-sync (state)
   "Synchronously refresh, preserving UI STATE."
@@ -481,6 +596,7 @@ Follow Magit's naming style with a repo-specific buffer when possible."
 (defun majjic--render-records (records state)
   "Render RECORDS and restore UI STATE."
   (setq majjic--abandon-selected-ids (majjic-state-abandon-selected-ids state))
+  (setq majjic--rebase-state (majjic-state-rebase-state state))
   (if records
       (progn
         (majjic--insert-records records
@@ -491,7 +607,8 @@ Follow Magit's naming style with a repo-specific buffer when possible."
           (goto-char (point-min))
           (when (magit-section-at)
             (magit-section-goto (magit-section-at))))
-        (majjic--sync-abandon-overlays))
+        (majjic--sync-abandon-overlays)
+        (majjic--sync-rebase-overlays))
     (majjic--insert-message "No revisions to show.")))
 
 (defun majjic--render-error (message)

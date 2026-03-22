@@ -31,4 +31,5 @@
 - `N` create a new child of the current revision and move to `@`
 - `e` edit the current revision and move to `@`
 - `a` enter abandon mode; in abandon mode, `SPC` toggles a revision, `RET` applies, and `C-g` cancels
+- `r` enter rebase mode; in rebase mode, `o` / `a` / `b` choose onto / after / before, `RET` applies, and `C-g` cancels
 - `g` refresh

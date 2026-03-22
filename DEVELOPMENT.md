@@ -15,6 +15,7 @@ Minimal Emacs UI for browsing `jj log`.
 - `N` creates a new child of the current revision and lands on `@`.
 - `e` edits the current revision and lands on `@`.
 - `a` enters abandon mode; `SPC` toggles the current revision, `RET` applies, and `C-g` cancels.
+- `r` enters rebase mode; `o` / `a` / `b` choose onto / after / before, `RET` applies, and `C-g` cancels.
 - `g` refreshes.
 
 ## Loading
