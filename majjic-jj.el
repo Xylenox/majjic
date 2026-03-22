@@ -17,8 +17,8 @@
 (require 'subr-x)
 (require 'majjic-model)
 
-(declare-function majjic--current-change-id "majjic-actions")
-(declare-function majjic--expanded-change-ids "majjic")
+(declare-function majjic--current-commit-id "majjic-actions")
+(declare-function majjic--expanded-commit-ids "majjic")
 (declare-function majjic--expanded-file-keys "majjic")
 (declare-function majjic--log-refresh-sync "majjic")
 (declare-function majjic--parse-log-output "majjic-model")
@@ -93,7 +93,7 @@ Keyword args:
          (target-spec (plist-get plist :target))
          (after-success (plist-get plist :after-success))
          (current-state (majjic--capture-refresh-state))
-         (target (majjic-state-current-change-id current-state)))
+         (target (majjic-state-current-commit-id current-state)))
     (unwind-protect
         (condition-case err
             (progn
@@ -103,8 +103,8 @@ Keyword args:
               (setq target (cond
                             ((functionp target-spec) (funcall target-spec))
                             (target-spec target-spec)
-                            (t (majjic-state-current-change-id current-state))))
-              (setf (majjic-state-current-change-id current-state) target)
+                            (t (majjic-state-current-commit-id current-state))))
+              (setf (majjic-state-current-commit-id current-state) target)
               (majjic--log-refresh-sync current-state))
           (error
            (message "%s" (error-message-string err))
@@ -113,7 +113,7 @@ Keyword args:
 
 (defun majjic--require-current-commit-id ()
   "Return the current revision commit id, or signal a user error."
-  (or (majjic--current-change-id)
+  (or (majjic--current-commit-id)
       (user-error "No revision selected")))
 
 (defun majjic--working-copy-commit-id ()

@@ -56,7 +56,7 @@ When nil, do not pass a limit to `jj log'."
 (defvar-local majjic--mutation-in-progress nil
   "Non-nil while a mutating Jujutsu command is running in this buffer.")
 
-(defvar-local majjic--abandon-selected-ids nil
+(defvar-local majjic--abandon-selected-commit-ids nil
   "List of commit ids selected in abandon mode.")
 
 (defvar-local majjic--abandon-overlays nil
@@ -96,7 +96,8 @@ When nil, do not pass a limit to `jj log'."
   :group 'majjic)
 
 (defclass majjic-revision-section (magit-section)
-  ((keymap :initform 'majjic-revision-section-map)))
+  ((keymap :initform 'majjic-revision-section-map)
+   (change-id :initarg :change-id)))
 
 (defclass majjic-summary-section (magit-section)
   ((keymap :initform 'majjic-summary-section-map)))
@@ -210,7 +211,7 @@ When nil, do not pass a limit to `jj log'."
     (setq majjic-abandon-mode nil)
     (user-error "Not in a majjic log buffer"))
   (unless majjic-abandon-mode
-    (setq majjic--abandon-selected-ids nil)
+    (setq majjic--abandon-selected-commit-ids nil)
     (majjic--clear-abandon-overlays))
   (force-mode-line-update))
 
@@ -341,7 +342,7 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
       (majjic-rebase-set-after)
     (when majjic-abandon-mode
       (user-error "Already in abandon mode"))
-    (setq majjic--abandon-selected-ids nil)
+    (setq majjic--abandon-selected-commit-ids nil)
     (majjic-abandon-mode 1)
     (message "Abandon mode: SPC toggle, RET apply, C-g cancel")))
 
@@ -355,8 +356,8 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
   (interactive)
   (unless majjic-abandon-mode
     (user-error "Not in abandon mode"))
-  (let* ((selected-ids majjic--abandon-selected-ids)
-         (fallbacks (majjic--selection-fallbacks (majjic--current-change-id))))
+  (let* ((selected-ids majjic--abandon-selected-commit-ids)
+         (fallbacks (majjic--selection-fallbacks (majjic--current-commit-id))))
     (when (null selected-ids)
       (user-error "No revisions selected for abandon"))
     (majjic--run-mutation
@@ -468,13 +469,16 @@ When already in rebase mode, switch the source back to a single revision."
 
 (defun majjic--run-confirmed-op-mutation (action thunk)
   "Preview the latest operation, confirm ACTION, and run mutating THUNK."
-  (let* ((current (majjic--current-change-id))
+  (let* ((current (majjic--current-commit-id))
+         (current-change-id (and current (majjic--change-id-for-commit-id current)))
          (fallbacks (majjic--selection-fallbacks current)))
     (when (majjic--confirm-latest-operation action)
       (majjic--run-mutation
        thunk
        :target (lambda ()
-                 (or (and current (majjic--revision-exists-p current) current)
+                 (or (and current-change-id
+                          (majjic--commit-id-for-change-id current-change-id))
+                     (and current (majjic--revision-exists-p current) current)
                      (seq-find #'majjic--revision-exists-p fallbacks)
                      (majjic--working-copy-commit-id)))))))
 
@@ -717,10 +721,10 @@ Follow Magit's naming style with a repo-specific buffer when possible."
 (defun majjic--capture-refresh-state ()
   "Capture the current transient UI state before a refresh."
   (make-majjic-state
-   :current-change-id (majjic--current-change-id)
-   :expanded-change-ids (majjic--expanded-change-ids)
+   :current-commit-id (majjic--current-commit-id)
+   :expanded-commit-ids (majjic--expanded-commit-ids)
    :expanded-file-keys (majjic--expanded-file-keys)
-   :abandon-selected-ids majjic--abandon-selected-ids
+   :abandon-selected-commit-ids majjic--abandon-selected-commit-ids
    :rebase-state majjic--rebase-state))
 
 (defun majjic--log-refresh-sync (state)
@@ -734,7 +738,7 @@ Follow Magit's naming style with a repo-specific buffer when possible."
 
 (defun majjic--render-records (records state)
   "Render RECORDS and restore UI STATE."
-  (setq majjic--abandon-selected-ids (majjic-state-abandon-selected-ids state))
+  (setq majjic--abandon-selected-commit-ids (majjic-state-abandon-selected-commit-ids state))
   (setq majjic--rebase-state (majjic-state-rebase-state state))
   (when majjic--rebase-state
     (setf (majjic-rebase-state-moved-change-ids majjic--rebase-state)
@@ -744,9 +748,9 @@ Follow Magit's naming style with a repo-specific buffer when possible."
   (if records
       (progn
         (majjic--insert-records records
-                                (majjic-state-expanded-change-ids state)
+                                (majjic-state-expanded-commit-ids state)
                                 (majjic-state-expanded-file-keys state))
-        (majjic--goto-change (majjic-state-current-change-id state))
+        (majjic--goto-commit (majjic-state-current-commit-id state))
         (unless (majjic--current-revision-section)
           (goto-char (point-min))
           (when (magit-section-at)
@@ -774,10 +778,10 @@ Follow Magit's naming style with a repo-specific buffer when possible."
     (user-error "Not in abandon mode"))
   (let ((commit-id (majjic--require-current-commit-id))
         (revision (majjic--current-revision-section)))
-    (setq majjic--abandon-selected-ids
-          (if (member commit-id majjic--abandon-selected-ids)
-              (cl-remove commit-id majjic--abandon-selected-ids :test #'equal)
-            (cons commit-id majjic--abandon-selected-ids)))
+    (setq majjic--abandon-selected-commit-ids
+          (if (member commit-id majjic--abandon-selected-commit-ids)
+              (cl-remove commit-id majjic--abandon-selected-commit-ids :test #'equal)
+            (cons commit-id majjic--abandon-selected-commit-ids)))
     (majjic--restyle-abandon-revision revision commit-id)))
 
 (defun majjic--restyle-abandon-revision (revision commit-id)
@@ -785,7 +789,7 @@ Follow Magit's naming style with a repo-specific buffer when possible."
   (when revision
     (let ((inhibit-read-only t))
       (majjic--delete-abandon-overlay commit-id)
-      (when (member commit-id majjic--abandon-selected-ids)
+      (when (member commit-id majjic--abandon-selected-commit-ids)
         (let ((overlay (make-overlay (oref revision start) (oref revision end) nil t t)))
           (overlay-put overlay 'majjic-abandon-commit-id commit-id)
           (overlay-put overlay 'face 'majjic-abandon-included-row)
@@ -798,7 +802,7 @@ Follow Magit's naming style with a repo-specific buffer when possible."
     (when (bound-and-true-p magit-root-section)
       (dolist (revision (oref magit-root-section children))
         (when (and (object-of-class-p revision 'majjic-revision-section)
-                   (member (oref revision value) majjic--abandon-selected-ids))
+                   (member (oref revision value) majjic--abandon-selected-commit-ids))
           (majjic--restyle-abandon-revision revision (oref revision value)))))))
 
 (defun majjic--delete-abandon-overlay (commit-id)
@@ -815,7 +819,7 @@ Follow Magit's naming style with a repo-specific buffer when possible."
   (mapc #'delete-overlay majjic--abandon-overlays)
   (setq majjic--abandon-overlays nil))
 
-(defun majjic--expanded-change-ids ()
+(defun majjic--expanded-commit-ids ()
   "Return commit ids whose file sections are currently expanded."
   (let (ids)
     (when (bound-and-true-p magit-root-section)
@@ -838,7 +842,7 @@ Follow Magit's naming style with a repo-specific buffer when possible."
                 (push (cons (oref child commit-id) (oref child path)) keys)))))))
     keys))
 
-(defun majjic--goto-change (commit-id)
+(defun majjic--goto-commit (commit-id)
   "Move point to COMMIT-ID if present in the current buffer."
   (when (and commit-id (bound-and-true-p magit-root-section))
     (when-let* ((section (seq-find (lambda (child)

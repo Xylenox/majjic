@@ -178,7 +178,7 @@
                            hunks)))))
     (nreverse hunks)))
 
-(defun majjic--insert-records (records expanded-change-ids expanded-file-keys)
+(defun majjic--insert-records (records expanded-commit-ids expanded-file-keys)
   "Insert RECORDS, restoring expanded revisions and files from saved state."
   (magit-insert-section (majjic-root-section)
     (dolist (record records)
@@ -189,10 +189,11 @@
         ('graph
          (magit-insert-section (majjic-graph-line-section)
            (magit-insert-heading (majjic--ansi-colorize (majjic-revision-heading record)))))
-        (_
+         (_
          (let* ((commit-id (majjic-revision-commit-id record))
-                (expanded (member commit-id expanded-change-ids)))
-           (magit-insert-section (majjic-revision-section commit-id)
+                (expanded (member commit-id expanded-commit-ids)))
+           (magit-insert-section (majjic-revision-section commit-id nil
+                                                          :change-id (majjic-revision-change-id record))
              (magit-insert-heading (majjic--revision-heading-text record))
              (when-let* ((summary (majjic-revision-summary record)))
                (magit-insert-section (majjic-summary-section commit-id (not expanded))
@@ -318,7 +319,7 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
       (majjic--add-rebase-target-overlay
        target-section
        (majjic-rebase-state-source-change-id majjic--rebase-state)
-       (oref target-section value)
+       (oref target-section change-id)
        (majjic-rebase-state-source-mode majjic--rebase-state)
        (majjic-rebase-state-target-mode majjic--rebase-state)))))
 
@@ -359,11 +360,11 @@ SOURCE-MODE controls whether the summary says revision or descendants."
                                         'face '(:inherit shadow :weight bold))
                             " "
                             (propertize source-text 'face 'shadow)
-                            (propertize (majjic--short-change-id source) 'face 'font-lock-keyword-face)
+                            (propertize (majjic--short-id source) 'face 'font-lock-keyword-face)
                             " "
                             (propertize label 'face 'shadow)
                             " "
-                            (propertize (majjic--short-change-id target) 'face 'font-lock-keyword-face)
+                            (propertize (majjic--short-id target) 'face 'font-lock-keyword-face)
                             "\n"))
            (summary-text (concat (propertize prefix 'face 'default) summary))
            (pos (if (eq target-mode 'before)
@@ -387,10 +388,10 @@ SOURCE-MODE controls whether the summary says revision or descendants."
     ('before "before")
     (_ "onto")))
 
-(defun majjic--short-change-id (commit-id)
-  "Return a compact display form of COMMIT-ID."
-  (if (stringp commit-id)
-      (substring commit-id 0 (min 8 (length commit-id)))
+(defun majjic--short-id (id)
+  "Return a compact display form of ID."
+  (if (stringp id)
+      (substring id 0 (min 8 (length id)))
     ""))
 
 (defun majjic--revision-marker-position (section)
@@ -404,23 +405,10 @@ SOURCE-MODE controls whether the summary says revision or descendants."
              (match-end 0)
            0)))))
 
-(defun majjic--revision-section-change-id (section)
-  "Return the visible change id text from revision SECTION's heading."
-  (save-excursion
-    (goto-char (oref section start))
-    (let ((line (buffer-substring-no-properties (line-beginning-position)
-                                                (line-end-position))))
-      (when (string-match "\\`[^[:alnum:]]*\\([[:alnum:]]+\\)" line)
-        (match-string 1 line)))))
-
 (defun majjic--revision-section-moved-p (section moved-change-ids)
-  "Return non-nil if SECTION's visible change id matches MOVED-CHANGE-IDS."
-  (when-let* ((visible-change-id (majjic--revision-section-change-id section)))
-    (seq-some (lambda (change-id)
-                (or (equal visible-change-id change-id)
-                    (string-prefix-p visible-change-id change-id)
-                    (string-prefix-p change-id visible-change-id)))
-              moved-change-ids)))
+  "Return non-nil if SECTION's change id is in MOVED-CHANGE-IDS."
+  (when-let* ((change-id (oref section change-id)))
+    (member change-id moved-change-ids)))
 
 (defun majjic--rebase-target-summary-prefix (section target-mode)
   "Return a graph prefix for a transient target summary near SECTION.

@@ -34,7 +34,7 @@
       (setq section (oref section parent)))
     section))
 
-(defun majjic--current-change-id ()
+(defun majjic--current-commit-id ()
   "Return the current revision's commit id, or nil."
   (when-let* ((section (majjic--current-revision-section)))
     (oref section value)))
