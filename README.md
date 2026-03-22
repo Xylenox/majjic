@@ -1,24 +1,10 @@
-# majjic (MAJ-jik)
+# majjic
 
-[jjui](https://github.com/idursun/jjui) + [magit](https://github.com/magit/magit) inspired jj ui for Emacs!
+[jjui](https://github.com/idursun/jjui) + [magit-section](https://github.com/magit/magit) inspired jj ui for Emacs!
 
-## Features
+## Demo
 
-### Expand Everything!
-
-<img src="./media/expand_everything.gif" width="50%" height="50%"/>
-
-### Open Files!
-
-<img src="./media/open_files.gif" width="50%" height="50%"/>
-
-### New and Edit Revisions!
-
-<img src="./media/new_and_edit.gif" width="50%" height="50%"/>
-
-### Abandon!
-
-<img src="./media/abandon.gif" width="50%" height="50%"/>
+![Demo](./media/majjic_demo.mov)
 
 ## Command Reference
 
