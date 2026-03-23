@@ -17,12 +17,23 @@
 (require 'subr-x)
 (require 'majjic-model)
 
+(declare-function majjic--capture-refresh-state "majjic")
 (declare-function majjic--current-commit-id "majjic-actions")
 (declare-function majjic--expanded-commit-ids "majjic")
 (declare-function majjic--expanded-file-keys "majjic")
+(declare-function majjic--log-refresh-async "majjic")
 (declare-function majjic--log-refresh-sync "majjic")
 (declare-function majjic--parse-log-output "majjic-model")
 (declare-function majjic--revision-commit-ids "majjic")
+(declare-function majjic--set-operation-status "majjic")
+(defvar majjic--record-separator)
+(defvar majjic--mutation-in-progress)
+(defvar majjic--mutation-process)
+(defvar majjic--process-generation)
+(defvar majjic--repo-root)
+(defvar majjic-log-limit)
+(defvar majjic-log-revset)
+(defvar majjic-program)
 
 (cl-defstruct (majjic-operation-record
                (:constructor majjic--make-operation-record))
@@ -63,25 +74,106 @@
 Signal an error if the process exits non-zero or the executable is missing."
   (unless (executable-find majjic-program)
     (error "Cannot find `%s' in PATH" majjic-program))
+  (pcase-let ((`(,exit-code ,stdout ,stderr) (apply #'majjic--call-jj-capture dir args)))
+    (if (zerop exit-code)
+        stdout
+      (error "%s" (majjic--jj-error-message stdout stderr)))))
+
+(defun majjic--call-jj-capture (dir &rest args)
+  "Run `majjic-program' in DIR with ARGS.
+Return a list of (EXIT-CODE STDOUT STDERR)."
+  (unless (executable-find majjic-program)
+    (error "Cannot find `%s' in PATH" majjic-program))
   (let ((stderr-file (make-temp-file "majjic-jj-stderr-")))
     (unwind-protect
         (with-temp-buffer
           (let ((default-directory dir))
             (let ((exit-code (apply #'process-file majjic-program nil
                                     (list (current-buffer) stderr-file) nil args))
-                  (stdout (buffer-string)))
-              (if (zerop exit-code)
-                  stdout
-                (let ((stderr (with-temp-buffer
-                                (insert-file-contents stderr-file)
-                                (buffer-string))))
-                  (error "%s" (string-trim (if (string-blank-p stderr)
-                                               stdout
-                                             stderr))))))))
+                  (stdout (buffer-string))
+                  (stderr (with-temp-buffer
+                            (insert-file-contents stderr-file)
+                            (buffer-string))))
+              (list exit-code stdout stderr))))
       (ignore-errors (delete-file stderr-file)))))
 
-(defun majjic--run-mutation (thunk &rest plist)
-  "Run mutating THUNK with refresh and simple in-flight protection.
+(defun majjic--jj-error-message (stdout stderr)
+  "Return a trimmed error message from STDOUT and STDERR."
+  (string-trim (if (string-blank-p stderr) stdout stderr)))
+
+(defun majjic--call-jj-capture-async (dir callback &rest args)
+  "Run `majjic-program' in DIR with ARGS and invoke CALLBACK on exit.
+CALLBACK receives (EXIT-CODE STDOUT STDERR).  If the originating buffer is
+killed before the process exits, drop the callback and clean up process
+buffers."
+  (unless (executable-find majjic-program)
+    (error "Cannot find `%s' in PATH" majjic-program))
+  (let* ((source-buffer (current-buffer))
+         (stdout-buffer (generate-new-buffer " *majjic-jj-stdout*"))
+         (stderr-buffer (generate-new-buffer " *majjic-jj-stderr*"))
+         (process
+          (let ((default-directory dir))
+            (make-process
+             :name "majjic-jj"
+             :buffer stdout-buffer
+             :stderr stderr-buffer
+             :command (cons majjic-program args)
+             :connection-type 'pipe
+             :noquery t
+             :sentinel #'majjic--jj-process-sentinel))))
+    (process-put process 'majjic-source-buffer source-buffer)
+    (process-put process 'majjic-stdout-buffer stdout-buffer)
+    (process-put process 'majjic-stderr-buffer stderr-buffer)
+    (process-put process 'majjic-callback callback)
+    process))
+
+(defun majjic--jj-process-sentinel (process _event)
+  "Handle completion for asynchronous Jujutsu PROCESS."
+  (when (memq (process-status process) '(exit signal))
+    (let* ((source-buffer (process-get process 'majjic-source-buffer))
+           (stdout-buffer (process-get process 'majjic-stdout-buffer))
+           (stderr-buffer (process-get process 'majjic-stderr-buffer))
+           (callback (process-get process 'majjic-callback))
+           (exit-code (process-exit-status process))
+           (stdout (if (buffer-live-p stdout-buffer)
+                       (with-current-buffer stdout-buffer
+                         (buffer-string))
+                     ""))
+           (stderr (if (buffer-live-p stderr-buffer)
+                       (with-current-buffer stderr-buffer
+                         (buffer-string))
+                     "")))
+      (unwind-protect
+          (when (and callback (buffer-live-p source-buffer))
+            (run-at-time
+             0 nil
+             (lambda ()
+               (when (buffer-live-p source-buffer)
+                 (with-current-buffer source-buffer
+                   (funcall callback exit-code stdout stderr))))))
+        (when (buffer-live-p stdout-buffer)
+          (kill-buffer stdout-buffer))
+        (when (buffer-live-p stderr-buffer)
+          (kill-buffer stderr-buffer))))))
+
+(defun majjic--operation-process-live-p (process)
+  "Return non-nil if PROCESS is a live process."
+  (and (processp process)
+       (process-live-p process)))
+
+(defun majjic--next-process-generation ()
+  "Increment and return the current process generation."
+  (setq majjic--process-generation (1+ majjic--process-generation)))
+
+(defun majjic--clear-mutation-state ()
+  "Clear mutation tracking and mode-line state in the current buffer."
+  (setq majjic--mutation-process nil)
+  (setq majjic--mutation-in-progress nil)
+  (majjic--set-operation-status nil))
+
+(defun majjic--run-mutation (command &rest plist)
+  "Run mutating COMMAND asynchronously with refresh and in-flight protection.
+COMMAND is either an argument list or a function returning one.
 Keyword args:
 :target is a commit id or a function returning one after success.
 :after-success is a function called before refreshing after success."
@@ -89,27 +181,43 @@ Keyword args:
     (user-error "Another jj mutation is already running"))
   (unless majjic--repo-root
     (user-error "Not inside a Jujutsu repository"))
-  (let* ((majjic--mutation-in-progress t)
-         (target-spec (plist-get plist :target))
+  (let* ((target-spec (plist-get plist :target))
          (after-success (plist-get plist :after-success))
-         (current-state (majjic--capture-refresh-state))
-         (target (majjic-state-current-commit-id current-state)))
-    (unwind-protect
-        (condition-case err
-            (progn
-              (funcall thunk)
-              (when after-success
-                (funcall after-success))
-              (setq target (cond
-                            ((functionp target-spec) (funcall target-spec))
-                            (target-spec target-spec)
-                            (t (majjic-state-current-commit-id current-state))))
-              (setf (majjic-state-current-commit-id current-state) target)
-              (majjic--log-refresh-sync current-state))
-          (error
-           (message "%s" (error-message-string err))
-           nil))
-      (setq majjic--mutation-in-progress nil))))
+         (args (if (functionp command) (funcall command) command))
+         (generation (majjic--next-process-generation))
+         process)
+    (setq majjic--mutation-in-progress t)
+    (majjic--set-operation-status "Running")
+    (condition-case err
+        (progn
+          (setq process
+                (apply #'majjic--call-jj-capture-async majjic--repo-root
+                       (lambda (exit-code stdout stderr)
+                         (when (= generation majjic--process-generation)
+                           (setq majjic--mutation-process nil)
+                           (if (zerop exit-code)
+                               (condition-case callback-err
+                                   (let* ((current-state (majjic--capture-refresh-state))
+                                          (target (majjic-state-current-commit-id current-state)))
+                                     (when after-success
+                                       (funcall after-success))
+                                     (setq target
+                                           (cond
+                                            ((functionp target-spec) (funcall target-spec))
+                                            (target-spec target-spec)
+                                            (t target)))
+                                     (setf (majjic-state-current-commit-id current-state) target)
+                                     (majjic--log-refresh-async current-state generation))
+                                 (error
+                                  (message "%s" (error-message-string callback-err))
+                                  (majjic--clear-mutation-state)))
+                             (message "%s" (majjic--jj-error-message stdout stderr))
+                             (majjic--clear-mutation-state))))
+                       args))
+          (setq majjic--mutation-process process))
+      (error
+       (majjic--clear-mutation-state)
+       (signal (car err) (cdr err))))))
 
 (defun majjic--require-current-commit-id ()
   "Return the current revision commit id, or signal a user error."
@@ -172,6 +280,53 @@ Keyword args:
 (defun majjic--redo-args ()
   "Return `jj redo' arguments."
   '("redo"))
+
+(defun majjic--git-fetch-args (&optional tracked)
+  "Return `jj git fetch' arguments.
+When TRACKED is non-nil, include `--tracked'."
+  (append '("git" "fetch")
+          (when tracked
+            '("--tracked"))))
+
+(defun majjic--git-push-change-args (commit-ids &optional dry-run)
+  "Return `jj git push --change' arguments for COMMIT-IDS.
+When DRY-RUN is non-nil, include `--dry-run'."
+  (append
+   (list "git" "push")
+   (cl-mapcan (lambda (commit-id) (list "--change" commit-id)) commit-ids)
+   (when dry-run
+     (list "--dry-run"))))
+
+(defun majjic--git-push-preview (commit-ids)
+  "Return colored dry-run output for pushing COMMIT-IDS by change."
+  (pcase-let ((`(,exit-code ,output) (majjic--git-push-preview-result commit-ids)))
+    (if (zerop exit-code)
+        output
+      (error "%s" output))))
+
+(defun majjic--git-push-preview-result (commit-ids)
+  "Return (EXIT-CODE OUTPUT) for a colored dry-run push of COMMIT-IDS."
+  (pcase-let* ((`(,exit-code ,stdout ,stderr)
+                (apply #'majjic--call-jj-capture majjic--repo-root
+                       (append
+                        (majjic--git-push-change-args commit-ids t)
+                        (list "--color" "always" "--no-pager"))))
+               (output (string-trim-right
+                        (if (string-blank-p stdout) stderr stdout))))
+    (list exit-code output)))
+
+(defun majjic--git-push-preview-result-async (commit-ids callback)
+  "Run a colored dry-run push for COMMIT-IDS and invoke CALLBACK on exit.
+CALLBACK receives (EXIT-CODE OUTPUT)."
+  (apply #'majjic--call-jj-capture-async majjic--repo-root
+         (lambda (exit-code stdout stderr)
+           (funcall callback
+                    exit-code
+                    (string-trim-right
+                     (if (string-blank-p stdout) stderr stdout))))
+         (append
+          (majjic--git-push-change-args commit-ids t)
+          (list "--color" "always" "--no-pager"))))
 
 (defun majjic--op-log-preview (&optional limit)
   "Return the latest operation log text for confirmation preview.

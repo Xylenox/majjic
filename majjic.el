@@ -47,6 +47,11 @@ When nil, do not pass a limit to `jj log'."
                  integer)
   :group 'majjic)
 
+(defcustom majjic-section-loading-delay 0.12
+  "Seconds to wait before showing a lazy section loading placeholder."
+  :type 'number
+  :group 'majjic)
+
 (defconst majjic--record-separator "\x1f"
   "Separator used to mark revision records in `jj log' output.")
 
@@ -55,6 +60,24 @@ When nil, do not pass a limit to `jj log'."
 
 (defvar-local majjic--mutation-in-progress nil
   "Non-nil while a mutating Jujutsu command is running in this buffer.")
+
+(defvar-local majjic--mutation-process nil
+  "The current asynchronous mutating Jujutsu process, if any.")
+
+(defvar-local majjic--refresh-process nil
+  "The current asynchronous refresh process, if any.")
+
+(defvar-local majjic--preview-in-progress nil
+  "Non-nil while an asynchronous preview command is running in this buffer.")
+
+(defvar-local majjic--preview-process nil
+  "The current asynchronous preview process, if any.")
+
+(defvar-local majjic--process-generation 0
+  "Generation counter used to ignore stale asynchronous callbacks.")
+
+(defvar-local majjic--render-generation 0
+  "Generation counter used to ignore stale asynchronous section reads.")
 
 (defvar-local majjic--marked-change-ids nil
   "List of change ids marked in the current log buffer.")
@@ -86,13 +109,20 @@ When nil, do not pass a limit to `jj log'."
 
 (declare-function majjic--clear-rebase-overlays "majjic-render")
 (declare-function majjic--change-id-for-commit-id "majjic-jj")
+(declare-function majjic--call-jj-capture-async "majjic-jj")
 (declare-function majjic--commit-id-for-change-id "majjic-jj")
 (declare-function majjic--effective-redo-operation-preview "majjic-jj")
 (declare-function majjic--effective-undo-operation-preview "majjic-jj")
+(declare-function majjic--git-push-preview-result-async "majjic-jj")
+(declare-function majjic--jj-error-message "majjic-jj")
+(declare-function majjic--log-args "majjic-jj")
+(declare-function majjic--operation-process-live-p "majjic-jj")
 (declare-function majjic--op-log-preview "majjic-jj")
 (declare-function majjic--redo-args "majjic-jj")
 (declare-function majjic--rebase-moved-change-ids "majjic-jj")
 (declare-function majjic--rebase-target-mode-label "majjic-render")
+(declare-function majjic--reset-section-load "majjic-render")
+(declare-function majjic--section-load-process-live-p "majjic-render")
 (declare-function majjic--sync-rebase-overlays "majjic-render")
 (declare-function majjic--undo-args "majjic-jj")
 
@@ -111,12 +141,21 @@ When nil, do not pass a limit to `jj log'."
    (change-id :initarg :change-id)))
 
 (defclass majjic-summary-section (magit-section)
-  ((keymap :initform 'majjic-summary-section-map)))
+  ((keymap :initform 'majjic-summary-section-map)
+   (render-generation :initarg :render-generation :initform 0)
+   (load-token :initform 0)
+   (load-process :initform nil)
+   (load-timer :initform nil)
+   (expanded-file-keys :initarg :expanded-file-keys :initform nil)))
 
 (defclass majjic-file-section (magit-section)
   ((keymap :initform 'majjic-file-section-map)
    (commit-id :initarg :commit-id)
-   (path :initarg :path)))
+   (path :initarg :path)
+   (render-generation :initarg :render-generation :initform 0)
+   (load-token :initform 0)
+   (load-process :initform nil)
+   (load-timer :initform nil)))
 
 (defclass majjic-rename-section (magit-section)
   ((keymap :initform 'majjic-summary-section-map)
@@ -139,6 +178,16 @@ When nil, do not pass a limit to `jj log'."
 (defclass majjic-graph-line-section (magit-section)
   ((keymap :initform 'majjic-summary-section-map)))
 
+(defvar-keymap majjic-git-fetch-map
+  :doc "Subcommands for `jj git fetch' in `majjic-log-mode'."
+  "f" #'majjic-git-fetch
+  "t" #'majjic-git-fetch-tracked)
+
+(defvar-keymap majjic-git-map
+  :doc "Prefix map for Git-backed remote operations in `majjic-log-mode'."
+  "f" majjic-git-fetch-map
+  "p" #'majjic-git-push)
+
 (defvar-keymap majjic-section-map
   :parent magit-section-mode-map
   "TAB" #'majjic-toggle-at-point
@@ -155,6 +204,7 @@ When nil, do not pass a limit to `jj log'."
   "r" #'majjic-rebase-start
   "u" #'majjic-undo
   "U" #'majjic-redo
+  "G" majjic-git-map
   "<wheel-up>" #'majjic-mwheel-scroll
   "<wheel-down>" #'majjic-mwheel-scroll
   "<mouse-4>" #'majjic-mwheel-scroll
@@ -232,6 +282,7 @@ When nil, do not pass a limit to `jj log'."
 (keymap-set majjic-log-mode-map "r" #'majjic-rebase-start)
 (keymap-set majjic-log-mode-map "u" #'majjic-undo)
 (keymap-set majjic-log-mode-map "U" #'majjic-redo)
+(keymap-set majjic-log-mode-map "G" majjic-git-map)
 (keymap-set majjic-log-mode-map "<wheel-up>" #'majjic-mwheel-scroll)
 (keymap-set majjic-log-mode-map "<wheel-down>" #'majjic-mwheel-scroll)
 (keymap-set majjic-log-mode-map "<mouse-4>" #'majjic-mwheel-scroll)
@@ -278,64 +329,152 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
       (majjic-log-mode)
       (setq default-directory source-dir)
       (setq majjic--repo-root repo-root)
-      (majjic-log-refresh))
+      (majjic--log-refresh-sync (majjic--capture-refresh-state)))
     (pop-to-buffer buffer)))
 
 (defun majjic-log-refresh ()
-  "Refresh the current Jujutsu log buffer."
+  "Refresh the current Jujutsu log buffer asynchronously."
   (interactive)
   (unless (derived-mode-p 'majjic-log-mode)
     (user-error "Not in a majjic log buffer"))
-  (majjic--log-refresh-sync (majjic--capture-refresh-state)))
+  (when majjic--mutation-in-progress
+    (user-error "Operation in progress"))
+  (majjic--log-refresh-async (majjic--capture-refresh-state)))
 
 (defun majjic-new ()
   "Create a new child of marked revisions, or current revision, and move to `@'."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
   (let ((parent-ids (or (majjic--marked-visible-commit-ids)
                         (list (majjic--require-current-commit-id)))))
     (majjic--run-mutation
      (lambda ()
-       (apply #'majjic--call-jj majjic--repo-root (cons "new" parent-ids)))
+       (cons "new" parent-ids))
      :target #'majjic--working-copy-commit-id)))
 
 (defun majjic-edit ()
   "Edit the current revision and move to `@'."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
   (let ((commit-id (majjic--require-current-commit-id)))
     (majjic--run-mutation
      (lambda ()
-       (majjic--call-jj majjic--repo-root "edit" "-r" commit-id))
+       (list "edit" "-r" commit-id))
      :target #'majjic--working-copy-commit-id)))
 
 (defun majjic-undo ()
   "Undo the latest Jujutsu operation after confirmation."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
   (majjic--run-confirmed-op-mutation
    "undo"
    (lambda ()
-     (apply #'majjic--call-jj majjic--repo-root (majjic--undo-args)))))
+     (majjic--undo-args))))
 
 (defun majjic-redo ()
   "Redo the latest undone Jujutsu operation after confirmation."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
   (majjic--run-confirmed-op-mutation
    "redo"
    (lambda ()
-     (apply #'majjic--call-jj majjic--repo-root (majjic--redo-args)))))
+     (majjic--redo-args))))
+
+(defun majjic--set-operation-status (status)
+  "Show STATUS in the mode line for the current Majjic buffer."
+  (setq mode-line-process (when status (list (format " %s" status))))
+  (force-mode-line-update))
+
+(defun majjic--operation-in-progress-p ()
+  "Return non-nil if a mutation, refresh, or preview is in flight."
+  (or majjic--mutation-in-progress
+      majjic--preview-in-progress
+      (majjic--operation-process-live-p majjic--preview-process)
+      (majjic--operation-process-live-p majjic--refresh-process)))
+
+(defun majjic--require-no-operation-in-progress ()
+  "Signal a user error if an async operation is currently in flight."
+  (when (majjic--operation-in-progress-p)
+    (user-error "Operation in progress")))
+
+(defun majjic--status-message (message &rest args)
+  "Show MESSAGE with ARGS in the minibuffer before an asynchronous operation."
+  (apply #'message message args)
+  (redisplay))
+
+(defun majjic-git-fetch (&optional tracked)
+  "Fetch from the configured Git remote and refresh.
+When TRACKED is non-nil, fetch only tracked bookmarks."
+  (interactive)
+  (majjic--require-no-operation-in-progress)
+  (when majjic-rebase-mode
+    (majjic-rebase-disabled-command))
+  (majjic--status-message
+   (if tracked
+       "Fetching tracked bookmarks from Git remote..."
+     "Fetching from Git remote..."))
+  (majjic--run-mutation
+   (lambda ()
+     (majjic--git-fetch-args tracked))))
+
+(defun majjic-git-fetch-tracked ()
+  "Fetch only tracked bookmarks from the configured Git remote and refresh."
+  (interactive)
+  (majjic-git-fetch t))
+
+(defun majjic-git-push ()
+  "Push marked visible revisions, or the current revision, by change.
+Ask for confirmation after a dry-run preview."
+  (interactive)
+  (majjic--require-no-operation-in-progress)
+  (when majjic-rebase-mode
+    (majjic-rebase-disabled-command))
+  (let ((commit-ids (or (majjic--marked-visible-commit-ids)
+                        (list (majjic--require-current-commit-id)))))
+    (majjic--status-message "Preparing Git push dry-run...")
+    (setq majjic--preview-in-progress t)
+    (majjic--set-operation-status "Previewing")
+    (condition-case err
+        (let (preview-finished
+              process)
+          (setq process
+                (majjic--git-push-preview-result-async
+                 commit-ids
+                 (lambda (exit-code preview)
+                   (setq preview-finished t)
+                   (setq majjic--preview-in-progress nil)
+                   (setq majjic--preview-process nil)
+                   (majjic--set-operation-status nil)
+                   (if (zerop exit-code)
+                       (when (majjic--confirm-preview "push" preview "Push selected changes? ")
+                         (majjic--status-message "Pushing selected changes...")
+                         (majjic--run-mutation
+                          (lambda ()
+                            (majjic--git-push-change-args commit-ids))))
+                     (majjic--show-preview "push" preview "Git push dry-run failed; press any key to close")
+                     (message "Git push dry-run failed")))))
+          (unless preview-finished
+            (setq majjic--preview-process process)))
+      (error
+       (setq majjic--preview-in-progress nil)
+       (setq majjic--preview-process nil)
+       (majjic--set-operation-status nil)
+       (signal (car err) (cdr err))))))
 
 (defun majjic-abandon-start ()
   "Abandon marked visible revisions after confirmation.
 Temporarily apply strike-through rendering while the confirmation prompt is
 open.  If rebase mode is active, keep using `a' for rebase-after instead."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (if majjic-rebase-mode
       (majjic-rebase-set-after)
     (let* ((selected-ids (majjic--marked-visible-commit-ids))
@@ -354,9 +493,8 @@ open.  If rebase mode is active, keep using `a' for rebase-after instead."
               (majjic--clear-abandon-overlays)
               (majjic--run-mutation
                (lambda ()
-                 (apply #'majjic--call-jj majjic--repo-root
-                        (append (list "abandon" "--retain-bookmarks")
-                                (majjic--prefixed-rev-args selected-ids))))
+                 (append (list "abandon" "--retain-bookmarks")
+                         (majjic--prefixed-rev-args selected-ids)))
                :target (lambda ()
                          (or (seq-find #'majjic--revision-exists-p fallbacks)
                              (majjic--working-copy-commit-id))))))
@@ -368,6 +506,7 @@ open.  If rebase mode is active, keep using `a' for rebase-after instead."
   "Enter rebase mode using the current revision as the source.
 When already in rebase mode, switch the source back to a single revision."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (if majjic-rebase-mode
       (majjic-rebase-set-source-revision)
     (let* ((visible-marked (majjic--marked-visible-change-ids))
@@ -390,6 +529,7 @@ When already in rebase mode, switch the source back to a single revision."
 (defun majjic-toggle-mark ()
   "Toggle a persistent mark on the current revision."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (let* ((revision (or (majjic--current-revision-section)
                        (user-error "No revision selected")))
          (change-id (oref revision change-id)))
@@ -407,6 +547,7 @@ When already in rebase mode, switch the source back to a single revision."
 (defun majjic-clear-marks ()
   "Clear all persistent marks in the current log buffer."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (setq majjic--marked-change-ids nil)
   (majjic--clear-mark-overlays)
   (majjic--refresh-rebase-source-from-marks)
@@ -427,31 +568,37 @@ This keybinding is reserved; the browser itself is not implemented yet."
 (defun majjic-rebase-set-onto ()
   "Set the rebase target placement to onto."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (majjic--rebase-set-target-mode 'onto))
 
 (defun majjic-rebase-set-after ()
   "Set the rebase target placement to after."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (majjic--rebase-set-target-mode 'after))
 
 (defun majjic-rebase-set-before ()
   "Set the rebase target placement to before."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (majjic--rebase-set-target-mode 'before))
 
 (defun majjic-rebase-set-source-revision ()
   "Set the rebase source to the selected revision only."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (majjic--rebase-set-source-mode 'revision))
 
 (defun majjic-rebase-set-source-descendants ()
   "Set the rebase source to the selected revision and its descendants."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (majjic--rebase-set-source-mode 'descendants))
 
 (defun majjic-rebase-apply ()
   "Apply the staged rebase."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (unless majjic-rebase-mode
     (user-error "Not in rebase mode"))
   (let* ((source (majjic-rebase-state-source-change-id majjic--rebase-state))
@@ -465,8 +612,7 @@ This keybinding is reserved; the browser itself is not implemented yet."
       (user-error "Rebase target is inside moved revisions"))
     (majjic--run-mutation
      (lambda ()
-       (apply #'majjic--call-jj majjic--repo-root
-              (majjic--rebase-args source target target-mode source-mode)))
+       (majjic--rebase-args source target target-mode source-mode))
      :after-success (lambda ()
                       (majjic-rebase-mode -1))
      :target (lambda ()
@@ -476,6 +622,7 @@ This keybinding is reserved; the browser itself is not implemented yet."
 (defun majjic-rebase-cancel ()
   "Cancel rebase mode without mutating the repository."
   (interactive)
+  (majjic--require-no-operation-in-progress)
   (unless majjic-rebase-mode
     (user-error "Not in rebase mode"))
   (majjic-rebase-mode -1)
@@ -503,12 +650,31 @@ This keybinding is reserved; the browser itself is not implemented yet."
 
 (defun majjic--confirm-latest-operation (action)
   "Show the effective operation preview in a side window and ask to perform ACTION."
-  (let* ((preview (pcase action
-                    ("undo" (majjic--effective-undo-operation-preview))
-                    ("redo" (majjic--effective-redo-operation-preview))
-                    (_ (majjic--op-log-preview))))
-         (buffer (get-buffer-create (format "*majjic %s preview*" action)))
-         (window nil))
+  (majjic--confirm-preview
+   action
+   (pcase action
+     ("undo" (majjic--effective-undo-operation-preview))
+     ("redo" (majjic--effective-redo-operation-preview))
+     (_ (majjic--op-log-preview)))
+   (format "%s latest change? " (capitalize action))))
+
+(defun majjic--confirm-preview (action preview prompt)
+  "Show PREVIEW for ACTION in a side window and ask PROMPT in the minibuffer."
+  (majjic--with-preview-window action preview (lambda () (y-or-n-p prompt))))
+
+(defun majjic--show-preview (action preview prompt)
+  "Show PREVIEW for ACTION in a side window and wait for one key with PROMPT."
+  (majjic--with-preview-window action preview
+                               (lambda ()
+                                 (message "%s" prompt)
+                                 (redisplay)
+                                 (read-key)
+                                 nil)))
+
+(defun majjic--with-preview-window (action preview body)
+  "Show PREVIEW for ACTION in a side window while running BODY."
+  (let ((buffer (get-buffer-create (format "*majjic %s preview*" action)))
+        (window nil))
     (unwind-protect
         (save-selected-window
           (majjic--prepare-op-preview-buffer buffer preview)
@@ -524,7 +690,7 @@ This keybinding is reserved; the browser itself is not implemented yet."
           (when (window-live-p window)
             (set-window-dedicated-p window t)
             (fit-window-to-buffer window majjic--op-preview-max-height 3 nil nil t))
-          (y-or-n-p (format "%s latest change? " (capitalize action))))
+          (funcall body))
       (when (window-live-p window)
         (quit-window t window))
       (when (buffer-live-p buffer)
@@ -671,6 +837,9 @@ toggle that section's body."
       (user-error "No section at point"))
      ((or (object-of-class-p section 'majjic-file-section)
           (object-of-class-p section 'majjic-hunk-section))
+      (when (and (object-of-class-p section 'majjic-file-section)
+                 (not (oref section hidden)))
+        (majjic--reset-section-load section))
       (when (and (object-of-class-p section 'majjic-hunk-section)
                  (oref section hidden))
         (majjic--prepare-missing-hunk-body section))
@@ -682,6 +851,8 @@ toggle that section's body."
              (summary (majjic--summary-child revision)))
         (unless summary
           (user-error "No section to toggle at point"))
+        (unless (oref summary hidden)
+          (majjic--reset-section-load summary))
         (magit-section-toggle summary)
         (magit-section-goto revision))))))
 
@@ -741,6 +912,44 @@ Follow Magit's naming style with a repo-specific buffer when possible."
    :marked-change-ids majjic--marked-change-ids
    :rebase-state majjic--rebase-state))
 
+(defun majjic--log-refresh-async (state &optional generation)
+  "Asynchronously refresh the current buffer, preserving UI STATE.
+When GENERATION is non-nil, treat the refresh as part of an existing mutation
+operation and ignore stale callbacks from older generations."
+  (unless majjic--repo-root
+    (user-error "Not inside a Jujutsu repository"))
+  (when (and (majjic--operation-process-live-p majjic--refresh-process)
+             (not generation))
+    (delete-process majjic--refresh-process))
+  (let ((refresh-generation (or generation
+                                (setq majjic--process-generation
+                                      (1+ majjic--process-generation))))
+        process)
+    (majjic--set-operation-status "Refreshing")
+    (setq process
+          (apply #'majjic--call-jj-capture-async majjic--repo-root
+                 (lambda (exit-code stdout stderr)
+                   (when (eq process majjic--refresh-process)
+                     (setq majjic--refresh-process nil))
+                   (when (= refresh-generation majjic--process-generation)
+                     (let ((inhibit-read-only t))
+                       (erase-buffer)
+                       (if (zerop exit-code)
+                           (condition-case err
+                               (majjic--render-records
+                                (majjic--parse-log-output stdout) state)
+                             (error
+                              (majjic--render-error (error-message-string err))))
+                         (majjic--render-error (majjic--jj-error-message stdout stderr)))))
+                   (when (and (= refresh-generation majjic--process-generation)
+                              (not (majjic--operation-process-live-p majjic--refresh-process)))
+                     (setq majjic--mutation-in-progress nil)
+                     (setq majjic--mutation-process nil)
+                     (majjic--set-operation-status nil)))
+                 (majjic--log-args)))
+    (setq majjic--refresh-process process)
+    process))
+
 (defun majjic--log-refresh-sync (state)
   "Synchronously refresh, preserving UI STATE."
   (let ((inhibit-read-only t))
@@ -752,6 +961,7 @@ Follow Magit's naming style with a repo-specific buffer when possible."
 
 (defun majjic--render-records (records state)
   "Render RECORDS and restore UI STATE."
+  (setq majjic--render-generation (1+ majjic--render-generation))
   (setq majjic--marked-change-ids (majjic-state-marked-change-ids state))
   (setq majjic--abandon-selected-commit-ids nil)
   (setq majjic--rebase-state (majjic-state-rebase-state state))
@@ -776,6 +986,7 @@ Follow Magit's naming style with a repo-specific buffer when possible."
 
 (defun majjic--render-error (message)
   "Render error MESSAGE in the current buffer."
+  (setq majjic--render-generation (1+ majjic--render-generation))
   (majjic--insert-message message))
 
 (defun majjic--revision-commit-ids ()

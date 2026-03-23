@@ -17,6 +17,44 @@
   (when-let* ((buffer (get-buffer "majjic: majjic-demo")))
     (kill-buffer buffer)))
 
+(defun majjic-test--process-live-p (process)
+  "Return non-nil if PROCESS is live."
+  (and (processp process)
+       (process-live-p process)))
+
+(defun majjic-test--section-load-live-p (&optional section)
+  "Return non-nil if SECTION or any descendant has a live async load."
+  (when-let* ((section (or section (and (bound-and-true-p magit-root-section)
+                                        magit-root-section))))
+    (or (and (ignore-errors (slot-exists-p section 'load-process))
+             (majjic-test--process-live-p (slot-value section 'load-process)))
+        (seq-some #'majjic-test--section-load-live-p
+                  (oref section children)))))
+
+(defun majjic-test--wait-for (predicate &optional timeout)
+  "Wait until PREDICATE returns non-nil, up to TIMEOUT seconds."
+  (let* ((timeout (or timeout 5))
+         (deadline (+ (float-time) timeout)))
+    (while (and (not (funcall predicate))
+                (< (float-time) deadline))
+      (accept-process-output nil 0.01))
+    (should (funcall predicate))))
+
+(defun majjic-test--wait-for-idle ()
+  "Wait for the current Majjic buffer to finish async work."
+  (majjic-test--wait-for
+   (lambda ()
+     (and (not majjic--mutation-in-progress)
+          (not majjic--preview-in-progress)
+          (not (majjic-test--process-live-p majjic--mutation-process))
+          (not (majjic-test--process-live-p majjic--preview-process))
+          (not (majjic-test--process-live-p majjic--refresh-process))
+          (not (majjic-test--section-load-live-p))))))
+
+(defun majjic-test--section-body-string (section)
+  "Return SECTION's body text without properties."
+  (buffer-substring-no-properties (oref section content) (oref section end)))
+
 (ert-deftest majjic-test-parse-root-and-trailing-elided ()
   "Root revisions should not synthesize a summary, and trailing `~' survives."
   (let* ((sep majjic--record-separator)
@@ -131,6 +169,7 @@
                                         '(:inherit (majjic-marked-row magit-section-highlight)))))
                           majjic--mark-overlays))
         (majjic-toggle-at-point)
+        (majjic-test--wait-for-idle)
         (majjic-section-forward)
         (let ((child-commit-id (majjic--current-commit-id)))
           (majjic-space)
@@ -218,6 +257,527 @@
   (should (equal (majjic--rebase-args '("src1" "src2") "dst" 'onto)
                  '("rebase" "--revisions" "src1" "--revisions" "src2" "--onto" "dst"))))
 
+(ert-deftest majjic-test-git-remote-command-args-and-bindings ()
+  "Git remote helpers should build expected args and live under a `G' prefix."
+  (should (equal (majjic--git-fetch-args)
+                 '("git" "fetch")))
+  (should (equal (majjic--git-fetch-args t)
+                 '("git" "fetch" "--tracked")))
+  (should (equal (majjic--git-push-change-args '("one"))
+                 '("git" "push" "--change" "one")))
+  (should (equal (majjic--git-push-change-args '("one" "two") t)
+                 '("git" "push" "--change" "one" "--change" "two" "--dry-run")))
+  (with-temp-buffer
+    (majjic-log-mode)
+    (should (eq (key-binding (kbd "G f f")) #'majjic-git-fetch))
+    (should (eq (key-binding (kbd "G f t")) #'majjic-git-fetch-tracked))
+    (should (eq (key-binding (kbd "G p")) #'majjic-git-push))
+    (should (eq (key-binding (kbd "p")) #'majjic-section-backward))))
+
+(ert-deftest majjic-test-git-push-confirmation-flow ()
+  "Push should preview, honor decline, and execute on confirmation."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          (majjic-rebase-mode nil)
+          (previewed nil)
+          (ran nil))
+      (cl-letf* (((symbol-function 'majjic--marked-visible-commit-ids)
+                  (lambda () '("c1" "c2")))
+                 ((symbol-function 'majjic--git-push-preview-result-async)
+                  (lambda (commit-ids callback)
+                    (setq previewed commit-ids)
+                    (funcall callback 0 "dry-run")))
+                 ((symbol-function 'majjic--confirm-preview)
+                  (lambda (_action _preview _prompt) nil))
+                 ((symbol-function 'majjic--run-mutation)
+                  (lambda (&rest _args)
+                    (setq ran t))))
+        (majjic-git-push)
+        (should (equal previewed '("c1" "c2")))
+        (should-not ran))
+      (setq previewed nil
+            ran nil)
+      (cl-letf* (((symbol-function 'majjic--marked-visible-commit-ids)
+                  (lambda () nil))
+                 ((symbol-function 'majjic--require-current-commit-id)
+                  (lambda () "current"))
+                 ((symbol-function 'majjic--git-push-preview-result-async)
+                  (lambda (commit-ids callback)
+                    (setq previewed commit-ids)
+                    (funcall callback 0 "dry-run")))
+                 ((symbol-function 'majjic--confirm-preview)
+                  (lambda (_action _preview _prompt) t))
+                 ((symbol-function 'majjic--run-mutation)
+                  (lambda (command &rest _args)
+                    (setq ran t)
+                    (should (equal (funcall command)
+                                   '("git" "push" "--change" "current"))))))
+        (majjic-git-push)
+        (should (equal previewed '("current")))
+        (should ran))
+      (let ((failed-preview nil))
+        (cl-letf* (((symbol-function 'majjic--marked-visible-commit-ids)
+                    (lambda () '("bad")))
+                   ((symbol-function 'majjic--git-push-preview-result-async)
+                    (lambda (_commit-ids callback)
+                      (funcall callback 1 "\e[31mError\e[0m")))
+                   ((symbol-function 'majjic--show-preview)
+                    (lambda (_action preview _prompt)
+                      (setq failed-preview preview))))
+          (majjic-git-push)
+          (should (equal failed-preview "\e[31mError\e[0m"))))
+      (setq majjic-rebase-mode t)
+      (should-error (majjic-git-push) :type 'user-error))))
+
+(ert-deftest majjic-test-git-push-preview-blocks-overlapping-operations ()
+  "The async push preview should block other repository operations."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          (majjic-rebase-mode nil))
+      (unwind-protect
+          (cl-letf* (((symbol-function 'majjic--marked-visible-commit-ids)
+                      (lambda () '("c1")))
+                     ((symbol-function 'majjic--git-push-preview-result-async)
+                      (lambda (_commit-ids _callback)
+                        'preview-process))
+                     ((symbol-function 'majjic--confirm-preview)
+                      (lambda (&rest _args)
+                        (error "confirmation should wait for preview callback"))))
+            (majjic-git-push)
+            (should majjic--preview-in-progress)
+            (should (eq majjic--preview-process 'preview-process))
+            (should-error (majjic-git-fetch) :type 'user-error))
+        (setq majjic--preview-in-progress nil)
+        (setq majjic--preview-process nil)
+        (majjic--set-operation-status nil)))))
+
+(ert-deftest majjic-test-git-fetch-routes-through-mutation ()
+  "Fetch should use the shared mutation path and call `jj git fetch'."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          (majjic-rebase-mode nil)
+          (ran nil))
+      (cl-letf (((symbol-function 'majjic--run-mutation)
+                 (lambda (command &rest _args)
+                   (setq ran t)
+                   (should (equal (funcall command) '("git" "fetch"))))))
+        (majjic-git-fetch)
+        (should ran)))
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          (majjic-rebase-mode nil)
+          (ran nil))
+      (cl-letf (((symbol-function 'majjic--run-mutation)
+                 (lambda (command &rest _args)
+                   (setq ran t)
+                   (should (equal (funcall command) '("git" "fetch" "--tracked"))))))
+        (majjic-git-fetch-tracked)
+        (should ran)))
+    (let ((majjic-rebase-mode t))
+      (should-error (majjic-git-fetch) :type 'user-error))))
+
+(ert-deftest majjic-test-async-refresh-drops-stale-callbacks ()
+  "Only the latest async refresh callback should update the buffer."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          callbacks
+          rendered)
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir callback &rest _args)
+                   (push callback callbacks)
+                   (if (= (length callbacks) 1) 'first 'second)))
+                ((symbol-function 'majjic--render-records)
+                 (lambda (records _state)
+                   (setq rendered records)))
+                ((symbol-function 'majjic--parse-log-output)
+                 (lambda (output)
+                   output)))
+        (majjic-log-refresh)
+        (majjic-log-refresh)
+        (should (= majjic--process-generation 2))
+        (funcall (nth 1 callbacks) 0 "stale" "")
+        (should-not rendered)
+        (funcall (nth 0 callbacks) 0 "fresh" "")
+        (should (equal rendered "fresh"))
+        (should-not mode-line-process)))))
+
+(ert-deftest majjic-test-async-mutation-serializes-in-flight-commands ()
+  "A second mutation should be rejected while the first async process is live."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let* ((majjic--repo-root "/tmp/majjic-test")
+           (process (make-process
+                     :name "majjic-test-sleep"
+                     :buffer nil
+                     :command '("sleep" "1")
+                     :noquery t)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                     (lambda (_dir _callback &rest _args)
+                       process)))
+            (majjic--run-mutation '("first"))
+            (should majjic--mutation-in-progress)
+            (should (eq majjic--mutation-process process))
+            (should-error (majjic--run-mutation '("second")) :type 'user-error))
+        (when (process-live-p process)
+          (delete-process process))
+        (setq majjic--mutation-process nil)
+        (setq majjic--mutation-in-progress nil)
+        (majjic--set-operation-status nil)))))
+
+(ert-deftest majjic-test-async-summary-expansion-loads-file-rows ()
+  "Lazy summary expansion should populate file rows asynchronously."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          callbacks)
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir callback &rest _args)
+                   (push callback callbacks)
+                   'summary-process)))
+        (let ((inhibit-read-only t))
+          (majjic--render-records
+           (list (make-majjic-revision
+                  :kind 'revision
+                  :change-id "change-1"
+                  :commit-id "commit-1"
+                  :heading "◆ commit-1 test"
+                  :summary "M file.txt"))
+           (make-majjic-state)))
+        (goto-char (point-min))
+        (majjic-toggle-at-point)
+        (should (= (length callbacks) 1))
+        (funcall (car callbacks) 0 "M file.txt\n" "")
+        (let* ((revision (majjic--current-revision-section))
+               (summary (majjic--summary-child revision))
+               (file (car (oref summary children))))
+          (should (object-of-class-p file 'majjic-file-section))
+          (should (equal (oref file path) "file.txt"))
+          (should-not (oref summary load-process)))))))
+
+(ert-deftest majjic-test-async-summary-expansion-skips-fast-loading-placeholder ()
+  "Fast summary loads should render results without flashing a loading placeholder."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          callback
+          timer-callback)
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir cb &rest _args)
+                   (setq callback cb)
+                   'summary-process))
+                ((symbol-function 'run-at-time)
+                 (lambda (secs repeat function &rest _args)
+                   (should (= secs majjic-section-loading-delay))
+                   (should-not repeat)
+                   (setq timer-callback function)
+                   'summary-timer)))
+        (let ((inhibit-read-only t))
+          (majjic--render-records
+           (list (make-majjic-revision
+                  :kind 'revision
+                  :change-id "change-1"
+                  :commit-id "commit-1"
+                  :heading "◆ commit-1 test"
+                  :summary "M file.txt"))
+           (make-majjic-state)))
+        (goto-char (point-min))
+        (majjic-toggle-at-point)
+        (let* ((revision (majjic--current-revision-section))
+               (summary (majjic--summary-child revision)))
+          (should (equal (majjic-test--section-body-string summary) ""))
+          (should (eq (oref summary load-timer) 'summary-timer))
+          (funcall callback 0 "M file.txt\n" "")
+          (should-not (oref summary load-timer))
+          (should-not (string-match-p "(loading\\.\\.\\.)"
+                                      (majjic-test--section-body-string summary)))
+          (funcall timer-callback)
+          (should (= (length (oref summary children)) 1))
+          (should-not (string-match-p "(loading\\.\\.\\.)"
+                                      (majjic-test--section-body-string summary))))))))
+
+(ert-deftest majjic-test-async-summary-expansion-shows-loading-placeholder-after-delay ()
+  "Slow summary loads should show a delayed loading placeholder before results."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          callback
+          timer-callback)
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir cb &rest _args)
+                   (setq callback cb)
+                   'summary-process))
+                ((symbol-function 'run-at-time)
+                 (lambda (_secs _repeat function &rest _args)
+                   (setq timer-callback function)
+                   'summary-timer)))
+        (let ((inhibit-read-only t))
+          (majjic--render-records
+           (list (make-majjic-revision
+                  :kind 'revision
+                  :change-id "change-1"
+                  :commit-id "commit-1"
+                  :heading "◆ commit-1 test"
+                  :summary "M file.txt"))
+           (make-majjic-state)))
+        (goto-char (point-min))
+        (majjic-toggle-at-point)
+        (let* ((revision (majjic--current-revision-section))
+               (summary (majjic--summary-child revision)))
+          (funcall timer-callback)
+          (should-not (oref summary load-timer))
+          (should (string-match-p "(loading\\.\\.\\.)"
+                                  (majjic-test--section-body-string summary)))
+          (funcall callback 0 "M file.txt\n" "")
+          (should (= (length (oref summary children)) 1))
+          (should-not (string-match-p "(loading\\.\\.\\.)"
+                                      (majjic-test--section-body-string summary))))))))
+
+(ert-deftest majjic-test-async-file-diff-expansion-loads-hunks ()
+  "Lazy file expansion should populate diff hunks asynchronously."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          callbacks)
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir callback &rest args)
+                   (push (cons (car args) callback) callbacks)
+                   (car args))))
+        (let ((inhibit-read-only t))
+          (majjic--render-records
+           (list (make-majjic-revision
+                  :kind 'revision
+                  :change-id "change-1"
+                  :commit-id "commit-1"
+                  :heading "◆ commit-1 test"
+                  :summary "M file.txt"))
+           (make-majjic-state)))
+        (goto-char (point-min))
+        (majjic-toggle-at-point)
+        (funcall (cdar callbacks) 0 "M file.txt\n" "")
+        (majjic-section-forward)
+        (majjic-toggle-at-point)
+        (funcall (cdar callbacks) 0 "@@ -1 +1 @@\n-old\n+new\n" "")
+        (let* ((file (majjic--current-file-section))
+               (hunk (car (oref file children))))
+          (should (object-of-class-p hunk 'majjic-hunk-section))
+          (should (equal (oref hunk body-lines) '("-old" "+new")))
+          (should-not (oref file load-process)))))))
+
+(ert-deftest majjic-test-async-section-load-drops-stale-callbacks ()
+  "Section load callbacks from a previous render should be ignored."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          callbacks
+          (records (list (make-majjic-revision
+                          :kind 'revision
+                          :change-id "change-1"
+                          :commit-id "commit-1"
+                          :heading "◆ commit-1 test"
+                          :summary "M file.txt"))))
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir cb &rest _args)
+                   (push cb callbacks)
+                   'summary-process)))
+        (let ((inhibit-read-only t))
+          (majjic--render-records records (make-majjic-state)))
+        (goto-char (point-min))
+        (let* ((old-revision (majjic--current-revision-section))
+               (old-summary (majjic--summary-child old-revision)))
+          (majjic-toggle-at-point)
+          (let ((inhibit-read-only t))
+            (majjic--render-records records (make-majjic-state)))
+          (funcall (car (last callbacks)) 0 "M stale.txt\n" "")
+          (should-not (oref old-summary children))
+          (should-not (oref (majjic--summary-child (majjic--current-revision-section)) children)))))))
+
+(ert-deftest majjic-test-async-section-load-drops-stale-loading-timers ()
+  "Loading timers from a previous render should be ignored."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          timer-callbacks
+          (records (list (make-majjic-revision
+                          :kind 'revision
+                          :change-id "change-1"
+                          :commit-id "commit-1"
+                          :heading "◆ commit-1 test"
+                          :summary "M file.txt"))))
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir _cb &rest _args)
+                   'summary-process))
+                ((symbol-function 'run-at-time)
+                 (lambda (_secs _repeat function &rest _args)
+                   (push function timer-callbacks)
+                   (list 'summary-timer (length timer-callbacks)))))
+        (let ((inhibit-read-only t))
+          (majjic--render-records records (make-majjic-state)))
+        (goto-char (point-min))
+        (let* ((old-revision (majjic--current-revision-section))
+               (old-summary (majjic--summary-child old-revision)))
+          (majjic-toggle-at-point)
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (majjic--render-records records (make-majjic-state)))
+          (should (= (length timer-callbacks) 2))
+          (funcall (car (last timer-callbacks)))
+          (should (equal (majjic-test--section-body-string old-summary) ""))
+          (should (equal (majjic-test--section-body-string
+                          (majjic--summary-child (majjic--current-revision-section)))
+                         "")))))))
+
+(ert-deftest majjic-test-async-section-load-restarts-after-close ()
+  "Closing a loading section should cancel the old request and restart on reopen."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          callbacks
+          processes
+          timer-callbacks
+          timers)
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir callback &rest _args)
+                   (let ((process (make-process
+                                   :name "majjic-test-section-load"
+                                   :buffer nil
+                                   :command '("sleep" "5")
+                                   :noquery t)))
+                     (push callback callbacks)
+                     (push process processes)
+                     process)))
+                ((symbol-function 'run-at-time)
+                 (lambda (_secs _repeat function &rest _args)
+                   (let ((timer (list 'summary-timer (1+ (length timers)))))
+                     (push function timer-callbacks)
+                     (push timer timers)
+                     timer))))
+        (unwind-protect
+            (progn
+              (let ((inhibit-read-only t))
+                (majjic--render-records
+                 (list (make-majjic-revision
+                        :kind 'revision
+                        :change-id "change-1"
+                        :commit-id "commit-1"
+                        :heading "◆ commit-1 test"
+                        :summary "M file.txt"))
+                 (make-majjic-state)))
+              (goto-char (point-min))
+              (majjic-toggle-at-point)
+              (let* ((revision (majjic--current-revision-section))
+                     (summary (majjic--summary-child revision))
+                     (first-process (car processes))
+                     (first-timer (car timers))
+                     (first-timer-callback (car timer-callbacks)))
+                (should (process-live-p first-process))
+                (should (equal (oref summary load-timer) first-timer))
+                (majjic-toggle-at-point)
+                (should-not (process-live-p first-process))
+                (should-not (oref summary load-timer))
+                (should (oref summary hidden))
+                (funcall first-timer-callback)
+                (should (equal (majjic-test--section-body-string summary) ""))
+                (majjic-toggle-at-point)
+                (should (= (length callbacks) 2))
+                (should (= (length timers) 2))
+                (should (equal (oref summary load-timer) (car timers)))
+                (funcall (car (last callbacks)) 0 "M stale.txt\n" "")
+                (should (equal (oref summary load-timer) (car timers)))))
+          (dolist (process processes)
+            (when (process-live-p process)
+              (delete-process process))))))))
+
+(ert-deftest majjic-test-async-mutation-recaptures-expanded-state ()
+  "Expansions made during a mutation should be preserved by the completion refresh."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          mutation-callback
+          refresh-state)
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir callback &rest args)
+                   (if (equal args '("describe"))
+                       (progn
+                         (setq mutation-callback callback)
+                         'mutation-process)
+                     'summary-process)))
+                ((symbol-function 'majjic--log-refresh-async)
+                 (lambda (state &optional _generation)
+                   (setq refresh-state state))))
+        (let ((inhibit-read-only t))
+          (majjic--render-records
+           (list (make-majjic-revision
+                  :kind 'revision
+                  :change-id "change-1"
+                  :commit-id "commit-1"
+                  :heading "◆ commit-1 test"
+                  :summary "M file.txt"))
+           (make-majjic-state)))
+        (majjic--run-mutation '("describe"))
+        (goto-char (point-min))
+        (majjic-toggle-at-point)
+        (funcall mutation-callback 0 "" "")
+        (should (equal (majjic-state-expanded-commit-ids refresh-state)
+                       '("commit-1")))))))
+
+(ert-deftest majjic-test-in-flight-mutation-blocks-main-buffer-commands ()
+  "Mutations should block state edits, but still allow unloaded lazy reads."
+  (skip-unless (file-directory-p "/Users/andyphan/code/majjic-demo/.jj"))
+  (let ((default-directory "/Users/andyphan/code/majjic-demo/"))
+    (majjic-test--kill-demo-buffer)
+    (majjic)
+    (with-current-buffer "majjic: majjic-demo"
+      (goto-char (point-min))
+      (let ((majjic--mutation-in-progress t))
+        (should-error (majjic-toggle-mark) :type 'user-error)
+        (should-error (majjic-clear-marks) :type 'user-error)
+        (should-error (majjic-log-refresh) :type 'user-error)
+        (should-error (majjic-rebase-start) :type 'user-error)
+        (majjic-toggle-at-point)
+        (majjic-section-forward))
+      (majjic-test--wait-for-idle)
+      (setq majjic--mutation-in-progress nil)
+      (goto-char (point-min))
+      (majjic-toggle-at-point)
+      (let ((majjic--mutation-in-progress t))
+        (majjic-toggle-at-point)
+        (majjic-toggle-at-point)))))
+
+(ert-deftest majjic-test-in-flight-mutation-allows-snapshot-visits ()
+  "Snapshot-style file visits should still work while a mutation is in flight."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          callback
+          called)
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir cb &rest _args)
+                   (setq callback cb)
+                   'summary-process))
+                ((symbol-function 'majjic--visit-file-new-side)
+                 (lambda (commit-id path &optional _line _column)
+                   (setq called (list commit-id path)))))
+        (let ((inhibit-read-only t))
+          (majjic--render-records
+           (list (make-majjic-revision
+                  :kind 'revision
+                  :change-id "change-1"
+                  :commit-id "commit-1"
+                  :heading "◆ commit-1 test"
+                  :summary "M file.txt"))
+           (make-majjic-state)))
+        (goto-char (point-min))
+        (majjic-toggle-at-point)
+        (funcall callback 0 "M file.txt\n" "")
+        (majjic-section-forward)
+        (let ((majjic--mutation-in-progress t))
+          (majjic-visit-file))
+        (should (equal called '("commit-1" "file.txt")))))))
+
 (ert-deftest majjic-test-new-uses-marked-revisions-when-present ()
   "`majjic-new' should use visible marked revisions as parents when present."
   (skip-unless (file-directory-p "/Users/andyphan/code/majjic-demo/.jj"))
@@ -234,11 +794,8 @@
                                                 (seq-take revisions 2)))
              (called nil))
         (cl-letf (((symbol-function 'majjic--run-mutation)
-                   (lambda (thunk &rest _args) (funcall thunk)))
-                  ((symbol-function 'majjic--call-jj)
-                   (lambda (_repo &rest args)
-                     (setq called args)
-                     "")))
+                   (lambda (command &rest _args)
+                     (setq called (funcall command)))))
           (majjic-new))
         (should (equal called (cons "new" parents)))))))
 
@@ -354,8 +911,8 @@
                      (lambda (&rest _args)
                        (setq prompted t)
                        picked-dir))
-                    ((symbol-function 'majjic-log-refresh)
-                     (lambda ()
+                    ((symbol-function 'majjic--log-refresh-sync)
+                     (lambda (_state)
                        (setq opened-root majjic--repo-root)
                        (setq opened-default-directory default-directory)))
                     ((symbol-function 'pop-to-buffer) #'ignore))
@@ -585,6 +1142,7 @@
               (should (search-forward "side" nil t))
               (beginning-of-line)
               (majjic-rebase-apply)
+              (majjic-test--wait-for-idle)
               (should (equal (majjic--change-id-for-commit-id (majjic--current-commit-id))
                              child-change))
               (should-not majjic-rebase-mode)
@@ -642,6 +1200,7 @@
                 (should (search-forward "side" nil t))
                 (beginning-of-line)
                 (majjic-rebase-apply)
+                (majjic-test--wait-for-idle)
                 (should-not majjic-rebase-mode)
                 (let* ((rebased-child (majjic--commit-id-for-change-id child-change))
                        (rebased-grandchild (majjic--commit-id-for-change-id grandchild-change)))
@@ -675,18 +1234,21 @@
         (majjic)
         (with-current-buffer (majjic--log-buffer-name repo)
           (majjic-new)
+          (majjic-test--wait-for-idle)
           (let ((second (jj "log" "-r" "@" "--no-graph" "--color" "never"
                             "--template" "commit_id")))
             (should-not (equal first second))
             (cl-letf (((symbol-function 'majjic--confirm-latest-operation)
                        (lambda (_action) t)))
               (majjic-undo))
+            (majjic-test--wait-for-idle)
             (should (equal (jj "log" "-r" "@" "--no-graph" "--color" "never"
                                "--template" "commit_id")
                            first))
             (cl-letf (((symbol-function 'majjic--confirm-latest-operation)
                        (lambda (_action) t)))
               (majjic-redo))
+            (majjic-test--wait-for-idle)
             (should (equal (jj "log" "-r" "@" "--no-graph" "--color" "never"
                             "--template" "commit_id")
                            second))))))))
@@ -726,12 +1288,14 @@
             (cl-letf (((symbol-function 'majjic--confirm-latest-operation)
                        (lambda (_action) t)))
               (majjic-undo))
+            (majjic-test--wait-for-idle)
             (should (equal (majjic--change-id-for-commit-id (majjic--current-commit-id))
                            change-id))
             (should (equal (majjic--current-commit-id) original-commit))
             (cl-letf (((symbol-function 'majjic--confirm-latest-operation)
                        (lambda (_action) t)))
               (majjic-redo))
+            (majjic-test--wait-for-idle)
             (should (equal (majjic--change-id-for-commit-id (majjic--current-commit-id))
                            change-id))
             (should (equal (majjic--current-commit-id) rewritten-commit))))))))
@@ -758,7 +1322,8 @@
       (with-current-buffer (majjic--log-buffer-name repo)
         (cl-letf (((symbol-function 'majjic--confirm-latest-operation)
                    (lambda (_action) t)))
-          (should-not (majjic-redo)))
+          (majjic-redo))
+        (majjic-test--wait-for-idle)
         (should-not majjic-rebase-mode)
         (should (derived-mode-p 'majjic-log-mode))))))
 

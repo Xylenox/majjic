@@ -18,10 +18,25 @@
 (require 'majjic-model)
 (require 'subr-x)
 
+(declare-function magit-section--set-section-properties "magit-section")
+(declare-function magit-section-hide "magit-section")
+(declare-function magit-section-lineage "magit-section")
+(declare-function magit-section-maybe-remove-heading-map "magit-section")
+(declare-function magit-section-maybe-remove-visibility-indicator "magit-section")
+(declare-function majjic--call-jj-capture-async "majjic-jj")
 (declare-function majjic--current-revision-section "majjic-actions")
+(declare-function majjic--summary-child "majjic-actions")
 (declare-function majjic--commit-id-for-change-id "majjic-jj")
+(declare-function majjic--jj-error-message "majjic-jj")
+(defvar magit-insert-section--current)
+(defvar magit-insert-section--parent)
+(defvar magit-root-section)
+(defvar majjic--repo-root)
 (defvar majjic--rebase-overlays)
 (defvar majjic--rebase-state)
+(defvar majjic--render-generation)
+(defvar majjic--selected-hunk-heading-overlays)
+(defvar majjic-section-loading-delay)
 (defvar majjic-rebase-mode)
 
 (defun majjic--revision-heading-text (record)
@@ -201,7 +216,9 @@
              (magit-insert-heading
               (majjic--top-level-row-text (majjic--revision-heading-text record)))
              (when-let* ((summary (majjic-revision-summary record)))
-               (magit-insert-section (majjic-summary-section commit-id (not expanded))
+               (magit-insert-section (majjic-summary-section commit-id (not expanded)
+                                                            :render-generation majjic--render-generation
+                                                            :expanded-file-keys expanded-file-keys)
                  (magit-insert-heading
                   (majjic--top-level-row-text (majjic--ansi-colorize summary)))
                  (magit-insert-section-body
@@ -221,10 +238,14 @@
 (defun majjic--insert-file-summary (commit-id expanded-file-keys)
   "Insert a lazily loaded file summary for COMMIT-ID.
 Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
+  (let* ((section magit-insert-section--current)
+         (prefix (majjic--file-summary-prefix)))
+    (majjic--start-file-summary-load section commit-id expanded-file-keys prefix)))
+
+(defun majjic--render-file-summary-body (commit-id expanded-file-keys output)
+  "Insert file summary rows for COMMIT-ID from OUTPUT.
+Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
   (let* ((prefix (majjic--file-summary-prefix))
-         (output (string-trim-right
-                  (majjic--call-jj majjic--repo-root "diff" "--summary"
-                                   "--color" "always" "-r" commit-id)))
          (file-changes (majjic--parse-file-summary-output output))
          (status-width (majjic--summary-status-width)))
     (if (string-empty-p output)
@@ -240,17 +261,21 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
                    (expanded (member (cons commit-id path) expanded-file-keys)))
               (magit-insert-section (majjic-file-section (cons commit-id path) (not expanded)
                                                          :commit-id commit-id
-                                                         :path path)
+                                                         :path path
+                                                         :render-generation majjic--render-generation)
                 (majjic--insert-file-heading heading-line color-source)
                 (magit-insert-section-body
                   (majjic--insert-file-diff commit-id path))))))))))
 
 (defun majjic--insert-file-diff (commit-id path)
   "Insert hunk sections for PATH in COMMIT-ID."
+  (let* ((section magit-insert-section--current)
+         (prefix (majjic--file-summary-prefix)))
+    (majjic--start-file-diff-load section commit-id path prefix)))
+
+(defun majjic--render-file-diff-body (output)
+  "Insert hunk sections from diff OUTPUT."
   (let* ((prefix (majjic--file-summary-prefix))
-         (output (string-trim-right
-                  (majjic--call-jj majjic--repo-root "diff" "--git"
-                                   "--color" "always" "-r" commit-id "--" path)))
          (hunks (majjic--parse-file-diff-output output)))
     (if hunks
         (dolist (hunk hunks)
@@ -269,6 +294,187 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
               (majjic--insert-hunk-body-lines prefix (majjic-hunk-body-lines hunk)))))
       (insert (majjic--body-text (concat prefix "(no diff)")) "\n"))))
 
+(defun majjic--insert-loading-placeholder (prefix)
+  "Insert a loading placeholder using PREFIX."
+  (insert (majjic--body-text (concat prefix "(loading...)")) "\n"))
+
+(defun majjic--section-slot-value (section slot)
+  "Return SECTION's SLOT value."
+  (funcall #'eieio-oref section slot))
+
+(defun majjic--set-section-slot-value (section slot value)
+  "Set SECTION's SLOT to VALUE."
+  (funcall #'eieio-oset section slot value))
+
+(defun majjic--section-load-current-p (section token render-generation)
+  "Return non-nil if SECTION's TOKEN and RENDER-GENERATION are still current."
+  (and (= render-generation majjic--render-generation)
+       (= token (majjic--section-slot-value section 'load-token))
+       (majjic--section-attached-p section)
+       (markerp (oref section start))
+       (markerp (oref section content))
+       (markerp (oref section end))
+       (marker-buffer (oref section start))
+       (marker-buffer (oref section content))
+       (marker-buffer (oref section end))))
+
+(defun majjic--clear-section-load-timer (section)
+  "Cancel SECTION's pending loading timer and clear its slot."
+  (when (ignore-errors (slot-exists-p section 'load-timer))
+    (let ((timer (majjic--section-slot-value section 'load-timer)))
+      (when (timerp timer)
+        (cancel-timer timer))
+      (majjic--set-section-slot-value section 'load-timer nil))))
+
+(defun majjic--section-load-timer-pending-p (section)
+  "Return non-nil if SECTION has a pending loading timer."
+  (and (ignore-errors (slot-exists-p section 'load-timer))
+       (majjic--section-slot-value section 'load-timer)))
+
+(defun majjic--schedule-loading-placeholder (section token render-generation prefix)
+  "Show SECTION's loading placeholder after a delay if TOKEN is still current."
+  (let (timer)
+    (setq timer
+          (run-at-time
+           majjic-section-loading-delay nil
+           (lambda ()
+             (when (and (eq timer (majjic--section-slot-value section 'load-timer))
+                        (majjic--section-load-current-p section token render-generation))
+               (majjic--set-section-slot-value section 'load-timer nil)
+               (majjic--replace-section-body
+                section
+                (lambda ()
+                  (majjic--insert-loading-placeholder prefix)))
+               (when (oref section hidden)
+                 (magit-section-hide section))))))
+    (majjic--set-section-slot-value section 'load-timer timer)))
+
+(defun majjic--start-file-summary-load (section commit-id expanded-file-keys prefix)
+  "Asynchronously load changed files for SECTION and COMMIT-ID."
+  (majjic--cancel-section-load section)
+  (let* ((token (1+ (majjic--section-slot-value section 'load-token)))
+         (render-generation majjic--render-generation)
+         process)
+    (majjic--set-section-slot-value section 'load-token token)
+    (majjic--schedule-loading-placeholder section token render-generation prefix)
+    (setq process
+          (majjic--call-jj-capture-async
+           majjic--repo-root
+           (lambda (exit-code stdout stderr)
+             (majjic--apply-section-load
+              section token render-generation process
+              (lambda ()
+                (if (zerop exit-code)
+                    (majjic--render-file-summary-body
+                     commit-id expanded-file-keys (string-trim-right stdout))
+                  (insert (majjic--body-text
+                           (concat (majjic--file-summary-prefix)
+                                   (majjic--jj-error-message stdout stderr)))
+                          "\n")))))
+           "diff" "--summary" "--color" "always" "-r" commit-id))
+    (majjic--set-section-slot-value section 'load-process process)))
+
+(defun majjic--start-file-diff-load (section commit-id path prefix)
+  "Asynchronously load diff hunks for SECTION, COMMIT-ID, and PATH."
+  (majjic--cancel-section-load section)
+  (let* ((token (1+ (majjic--section-slot-value section 'load-token)))
+         (render-generation majjic--render-generation)
+         process)
+    (majjic--set-section-slot-value section 'load-token token)
+    (majjic--schedule-loading-placeholder section token render-generation prefix)
+    (setq process
+          (majjic--call-jj-capture-async
+           majjic--repo-root
+           (lambda (exit-code stdout stderr)
+             (majjic--apply-section-load
+              section token render-generation process
+              (lambda ()
+                (if (zerop exit-code)
+                    (majjic--render-file-diff-body (string-trim-right stdout))
+                  (insert (majjic--body-text
+                           (concat (majjic--file-summary-prefix)
+                                   (majjic--jj-error-message stdout stderr)))
+                          "\n")))))
+           "diff" "--git" "--color" "always" "-r" commit-id "--" path))
+    (majjic--set-section-slot-value section 'load-process process)))
+
+(defun majjic--cancel-section-load (section)
+  "Cancel any in-flight async load for SECTION."
+  (when (majjic--section-load-process-live-p section)
+    (delete-process (majjic--section-slot-value section 'load-process)))
+  (majjic--clear-section-load-timer section)
+  (when (ignore-errors (slot-exists-p section 'load-process))
+    (majjic--set-section-slot-value section 'load-process nil)))
+
+(defun majjic--reset-section-load (section)
+  "Cancel SECTION's in-flight load and restore its lazy washer."
+  (when (or (majjic--section-load-process-live-p section)
+            (majjic--section-load-timer-pending-p section))
+    (majjic--cancel-section-load section)
+    (let ((inhibit-read-only t)
+          (content (oref section content)))
+      (delete-region content (oref section end))
+      (oset section children nil)
+      (oset section end (copy-marker content))
+      (cond
+       ((object-of-class-p section 'majjic-summary-section)
+        (let ((commit-id (oref section value))
+              (expanded-file-keys
+               (majjic--section-slot-value section 'expanded-file-keys)))
+          (oset section washer
+                (lambda ()
+                  (majjic--insert-file-summary commit-id expanded-file-keys)))))
+       ((object-of-class-p section 'majjic-file-section)
+        (let ((commit-id (oref section commit-id))
+              (path (oref section path)))
+          (oset section washer
+                (lambda ()
+                  (majjic--insert-file-diff commit-id path)))))))))
+
+(defun majjic--section-load-process-live-p (section)
+  "Return non-nil if SECTION has a live load process."
+  (and (ignore-errors (slot-exists-p section 'load-process))
+       (processp (majjic--section-slot-value section 'load-process))
+       (process-live-p (majjic--section-slot-value section 'load-process))))
+
+(defun majjic--apply-section-load (section token render-generation process inserter)
+  "Apply async section load INSERTER when SECTION, TOKEN, and PROCESS are current."
+  (when (eq process (majjic--section-slot-value section 'load-process))
+    (majjic--set-section-slot-value section 'load-process nil)
+    (majjic--clear-section-load-timer section))
+  (when (majjic--section-load-current-p section token render-generation)
+    (majjic--replace-section-body section inserter)
+    (when (oref section hidden)
+      (magit-section-hide section))))
+
+(defun majjic--replace-section-body (section inserter)
+  "Replace SECTION's body by calling INSERTER with Magit section bindings."
+  (let ((inhibit-read-only t)
+        (lineage (magit-section-lineage section t))
+        (magit-insert-section--parent section)
+        (magit-insert-section--current section))
+    (save-excursion
+      (goto-char (oref section content))
+      (delete-region (oref section content) (oref section end))
+      (oset section children nil)
+      (dolist (ancestor lineage)
+        (set-marker-insertion-type (oref ancestor end) t))
+      (unwind-protect
+          (funcall inserter)
+        (dolist (ancestor lineage)
+          (set-marker-insertion-type (oref ancestor end) nil)))
+      (oset section end (point-marker)))
+    (magit-section--set-section-properties section)
+    (magit-section-maybe-remove-heading-map section)
+    (magit-section-maybe-remove-visibility-indicator section)))
+
+(defun majjic--section-attached-p (section)
+  "Return non-nil if SECTION is still attached to the current root section."
+  (let ((current section))
+    (while (and current (oref current parent))
+      (setq current (oref current parent)))
+    (eq current magit-root-section)))
+
 (defun majjic--insert-hunk-body-lines (prefix body-lines)
   "Insert BODY-LINES for a hunk using PREFIX and preserve color."
   (dolist (body-line body-lines)
@@ -278,9 +484,9 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
   "If HUNK lost its body text while hidden, regenerate it on the next show."
   (when (and (= (oref hunk content) (oref hunk end))
              (null (oref hunk washer))
-             (oref hunk body-lines))
-    (let ((prefix (or (oref hunk body-prefix) ""))
-          (body-lines (oref hunk body-lines)))
+             (majjic--section-slot-value hunk 'body-lines))
+    (let ((prefix (or (majjic--section-slot-value hunk 'body-prefix) ""))
+          (body-lines (majjic--section-slot-value hunk 'body-lines)))
       (oset hunk washer
             (lambda ()
               (majjic--insert-hunk-body-lines prefix body-lines))))))
