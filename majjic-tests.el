@@ -458,6 +458,36 @@
           (should (equal (oref file path) "file.txt"))
           (should-not (oref summary load-process)))))))
 
+(ert-deftest majjic-test-async-summary-expansion-skips-oversized-summary ()
+  "Oversized lazy summaries should not render thousands of file sections."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          (majjic-file-summary-limit 2)
+          callback)
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir cb &rest _args)
+                   (setq callback cb)
+                   'summary-process)))
+        (let ((inhibit-read-only t))
+          (majjic--render-records
+           (list (make-majjic-revision
+                  :kind 'revision
+                  :change-id "change-1"
+                  :commit-id "commit-1"
+                  :heading "◆ commit-1 test"
+                  :summary "M file.txt"))
+           (make-majjic-state)))
+        (goto-char (point-min))
+        (majjic-toggle-at-point)
+        (funcall callback 0 "M one.txt\nM two.txt\nM three.txt\n" "")
+        (let* ((revision (majjic--current-revision-section))
+               (summary (majjic--summary-child revision))
+               (body (majjic-test--section-body-string summary)))
+          (should-not (oref summary children))
+          (should (string-match-p "3 file changes" body))
+          (should (string-match-p "limit is 2" body)))))))
+
 (ert-deftest majjic-test-async-summary-expansion-skips-fast-loading-placeholder ()
   "Fast summary loads should render results without flashing a loading placeholder."
   (with-temp-buffer

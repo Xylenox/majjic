@@ -52,6 +52,13 @@ When nil, do not pass a limit to `jj log'."
   :type 'number
   :group 'majjic)
 
+(defcustom majjic-file-summary-limit 2000
+  "Maximum number of changed-file summary rows to render inline.
+When nil, render every row from `jj diff --summary'."
+  :type '(choice (const :tag "No limit" nil)
+                 natnum)
+  :group 'majjic)
+
 (defconst majjic--record-separator "\x1f"
   "Separator used to mark revision records in `jj log' output.")
 

@@ -36,6 +36,7 @@
 (defvar majjic--rebase-state)
 (defvar majjic--render-generation)
 (defvar majjic--selected-hunk-heading-overlays)
+(defvar majjic-file-summary-limit)
 (defvar majjic-section-loading-delay)
 (defvar majjic-rebase-mode)
 
@@ -246,26 +247,51 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
   "Insert file summary rows for COMMIT-ID from OUTPUT.
 Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
   (let* ((prefix (majjic--file-summary-prefix))
-         (file-changes (majjic--parse-file-summary-output output))
+         (change-count (majjic--file-summary-row-count output))
          (status-width (majjic--summary-status-width)))
-    (if (string-empty-p output)
-        (insert (majjic--body-text (concat prefix "(no files changed)")) "\n")
-      (dolist (file-change file-changes)
-        (let* ((raw-line (majjic-file-change-raw-line file-change))
-               (heading-line (concat prefix (majjic--format-summary-line raw-line status-width)))
-               (color-source (concat prefix raw-line)))
-          (if (majjic-file-change-rename file-change)
-              (magit-insert-section (majjic-rename-section nil nil :commit-id commit-id)
-                (majjic--insert-file-heading heading-line color-source))
-            (let* ((path (majjic-file-change-path file-change))
-                   (expanded (member (cons commit-id path) expanded-file-keys)))
-              (magit-insert-section (majjic-file-section (cons commit-id path) (not expanded)
-                                                         :commit-id commit-id
-                                                         :path path
-                                                         :render-generation majjic--render-generation)
-                (majjic--insert-file-heading heading-line color-source)
-                (magit-insert-section-body
-                  (majjic--insert-file-diff commit-id path))))))))))
+    (cond
+     ((zerop change-count)
+      (insert (majjic--body-text (concat prefix "(no files changed)")) "\n"))
+     ((and majjic-file-summary-limit
+           (> change-count majjic-file-summary-limit))
+      (insert
+       (majjic--body-text
+        (concat
+         prefix
+         (format "(%s file changes; too many to expand inline, limit is %s)"
+                 change-count majjic-file-summary-limit)))
+       "\n"))
+     (t
+      (let ((file-changes (majjic--parse-file-summary-output output)))
+        (dolist (file-change file-changes)
+          (let* ((raw-line (majjic-file-change-raw-line file-change))
+                 (heading-line (concat prefix (majjic--format-summary-line raw-line status-width)))
+                 (color-source (concat prefix raw-line)))
+            (if (majjic-file-change-rename file-change)
+                (magit-insert-section (majjic-rename-section nil nil :commit-id commit-id)
+                  (majjic--insert-file-heading heading-line color-source))
+              (let* ((path (majjic-file-change-path file-change))
+                     (expanded (member (cons commit-id path) expanded-file-keys)))
+                (magit-insert-section (majjic-file-section (cons commit-id path) (not expanded)
+                                                           :commit-id commit-id
+                                                           :path path
+                                                           :render-generation majjic--render-generation)
+                  (majjic--insert-file-heading heading-line color-source)
+                  (magit-insert-section-body
+                    (majjic--insert-file-diff commit-id path))))))))))))
+
+(defun majjic--file-summary-row-count (output)
+  "Return the number of non-empty summary rows in OUTPUT."
+  (save-match-data
+    (let ((count 0)
+          (start 0)
+          end)
+      (while (< start (length output))
+        (setq end (string-match "\n" output start))
+        (unless (= start (or end (length output)))
+          (setq count (1+ count)))
+        (setq start (if end (1+ end) (length output))))
+      count)))
 
 (defun majjic--insert-file-diff (commit-id path)
   "Insert hunk sections for PATH in COMMIT-ID."
