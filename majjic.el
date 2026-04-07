@@ -118,6 +118,7 @@ When nil, render every row from `jj diff --summary'."
 (declare-function majjic--change-id-for-commit-id "majjic-jj")
 (declare-function majjic--call-jj-capture-async "majjic-jj")
 (declare-function majjic--commit-id-for-change-id "majjic-jj")
+(declare-function majjic--describe-args "majjic-jj")
 (declare-function majjic--effective-redo-operation-preview "majjic-jj")
 (declare-function majjic--effective-undo-operation-preview "majjic-jj")
 (declare-function majjic--git-push-preview-result-async "majjic-jj")
@@ -128,6 +129,7 @@ When nil, render every row from `jj diff --summary'."
 (declare-function majjic--redo-args "majjic-jj")
 (declare-function majjic--rebase-moved-change-ids "majjic-jj")
 (declare-function majjic--rebase-target-mode-label "majjic-render")
+(declare-function majjic--revision-description "majjic-jj")
 (declare-function majjic--reset-section-load "majjic-render")
 (declare-function majjic--section-load-process-live-p "majjic-render")
 (declare-function majjic--sync-rebase-overlays "majjic-render")
@@ -204,6 +206,7 @@ When nil, render every row from `jj diff --summary'."
   "^" #'majjic-section-up
   "N" #'majjic-new
   "e" #'majjic-edit
+  "d" #'majjic-describe
   "M" #'majjic-clear-marks
   "O" #'majjic-op-log-browser
   "B" #'majjic-bookmark-browser
@@ -282,6 +285,7 @@ When nil, render every row from `jj diff --summary'."
 (keymap-set majjic-log-mode-map "^" #'majjic-section-up)
 (keymap-set majjic-log-mode-map "N" #'majjic-new)
 (keymap-set majjic-log-mode-map "e" #'majjic-edit)
+(keymap-set majjic-log-mode-map "d" #'majjic-describe)
 (keymap-set majjic-log-mode-map "M" #'majjic-clear-marks)
 (keymap-set majjic-log-mode-map "O" #'majjic-op-log-browser)
 (keymap-set majjic-log-mode-map "B" #'majjic-bookmark-browser)
@@ -372,6 +376,24 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
      (lambda ()
        (list "edit" "-r" commit-id))
      :target #'majjic--working-copy-commit-id)))
+
+(defun majjic-describe ()
+  "Describe the current revision using a minibuffer prompt."
+  (interactive)
+  (majjic--require-no-operation-in-progress)
+  (when majjic-rebase-mode
+    (majjic-rebase-disabled-command))
+  (let* ((commit-id (majjic--require-current-commit-id))
+         (change-id (majjic--change-id-for-commit-id commit-id))
+         (description (majjic--revision-description commit-id))
+         (message (read-string "Description: " description)))
+    (majjic--status-message "Describing selected revision...")
+    (majjic--run-mutation
+     (lambda ()
+       (majjic--describe-args commit-id message))
+     :target (lambda ()
+               (or (majjic--commit-id-for-change-id change-id)
+                   (majjic--working-copy-commit-id))))))
 
 (defun majjic-undo ()
   "Undo the latest Jujutsu operation after confirmation."

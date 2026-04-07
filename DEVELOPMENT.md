@@ -14,6 +14,7 @@ Minimal Emacs UI for browsing `jj log`.
 - `n` / `p` use visible-section motion; from revision headings they skip the auxiliary summary/elided/connector rows, but still descend into expanded file sections; `M-n` / `M-p` move among siblings; `^` jumps to the parent section.
 - `N` creates a new child of the marked revisions, or the current revision if none are marked, and lands on `@`.
 - `e` edits the current revision and lands on `@`.
+- `d` describes the current revision with a minibuffer prompt.
 - `SPC` toggles a persistent mark on the current revision and moves to the next revision.
 - `M` clears all marks.
 - `a` abandons the currently marked revisions after confirmation.

@@ -281,6 +281,16 @@ Keyword args:
   "Return `jj redo' arguments."
   '("redo"))
 
+(defun majjic--describe-args (commit-id message)
+  "Return `jj describe' arguments for COMMIT-ID and MESSAGE."
+  (list "describe" "-r" commit-id "-m" message))
+
+(defun majjic--revision-description (commit-id)
+  "Return the description for COMMIT-ID in the current repository view."
+  (majjic--call-jj majjic--repo-root "log" "-r" commit-id
+                  "--ignore-working-copy" "--no-graph"
+                  "--color" "never" "--template" "description"))
+
 (defun majjic--git-fetch-args (&optional tracked)
   "Return `jj git fetch' arguments.
 When TRACKED is non-nil, include `--tracked'."

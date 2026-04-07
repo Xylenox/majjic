@@ -257,6 +257,78 @@
   (should (equal (majjic--rebase-args '("src1" "src2") "dst" 'onto)
                  '("rebase" "--revisions" "src1" "--revisions" "src2" "--onto" "dst"))))
 
+(ert-deftest majjic-test-describe-command-args-description-and-binding ()
+  "Describe helpers should build args, read descriptions, and bind to `d'."
+  (should (equal (majjic--describe-args "commit-1" "hello")
+                 '("describe" "-r" "commit-1" "-m" "hello")))
+  (let ((majjic--repo-root "/tmp/majjic-test")
+        called)
+    (cl-letf (((symbol-function 'majjic--call-jj)
+               (lambda (_dir &rest args)
+                 (setq called args)
+                 "current description")))
+      (should (equal (majjic--revision-description "commit-1")
+                     "current description"))
+      (should (equal called '("log" "-r" "commit-1"
+                              "--ignore-working-copy" "--no-graph"
+                              "--color" "never" "--template" "description")))))
+  (with-temp-buffer
+    (majjic-log-mode)
+    (should (eq (key-binding (kbd "d")) #'majjic-describe))))
+
+(ert-deftest majjic-test-describe-routes-current-revision-through-mutation ()
+  "Describe should prompt from the current revision and reselect its change."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          (majjic--marked-change-ids '("marked-change"))
+          (majjic-rebase-mode nil)
+          target-spec
+          ran)
+      (cl-letf (((symbol-function 'majjic--change-id-for-commit-id)
+                 (lambda (commit-id)
+                   (should (equal commit-id "commit-1"))
+                   "change-1"))
+                ((symbol-function 'majjic--revision-description)
+                 (lambda (commit-id)
+                   (should (equal commit-id "commit-1"))
+                   "old description"))
+                ((symbol-function 'read-string)
+                 (lambda (prompt &optional initial-input &rest _args)
+                   (should (equal prompt "Description: "))
+                   (should (equal initial-input "old description"))
+                   "new description"))
+                ((symbol-function 'majjic--commit-id-for-change-id)
+                 (lambda (change-id)
+                   (should (equal change-id "change-1"))
+                   "rewritten-commit"))
+                ((symbol-function 'majjic--run-mutation)
+                 (lambda (command &rest plist)
+                   (setq ran (funcall command))
+                   (setq target-spec (plist-get plist :target)))))
+        (let ((inhibit-read-only t))
+          (majjic--render-records
+           (list (make-majjic-revision
+                  :kind 'revision
+                  :change-id "change-1"
+                  :commit-id "commit-1"
+                  :heading "◆ commit-1 test"
+                  :summary "old description"))
+           (make-majjic-state)))
+        (majjic-describe)
+        (should (equal ran '("describe" "-r" "commit-1" "-m" "new description")))
+        (should (equal (funcall target-spec) "rewritten-commit"))))))
+
+(ert-deftest majjic-test-describe-rejects-unavailable-states ()
+  "Describe should use the normal main-buffer mutation guards."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test"))
+      (let ((majjic--mutation-in-progress t))
+        (should-error (majjic-describe) :type 'user-error))
+      (let ((majjic-rebase-mode t))
+        (should-error (majjic-describe) :type 'user-error)))))
+
 (ert-deftest majjic-test-git-remote-command-args-and-bindings ()
   "Git remote helpers should build expected args and live under a `G' prefix."
   (should (equal (majjic--git-fetch-args)

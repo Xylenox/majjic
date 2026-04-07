@@ -16,6 +16,7 @@ https://github.com/user-attachments/assets/9da48e9c-72da-463d-91a3-b97fefcf597d
 - `^` jump to parent section
 - `N` create a new child of the marked revisions, or the current revision if none are marked, and move to `@`
 - `e` edit the current revision and move to `@`
+- `d` describe the current revision with a minibuffer prompt
 - `SPC` toggle a persistent mark on the current revision and move to the next revision
 - `M` clear all marks
 - `a` abandon the currently marked revisions after confirmation
