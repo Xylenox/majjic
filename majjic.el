@@ -134,6 +134,7 @@ When nil, render every row from `jj diff --summary'."
 (declare-function majjic--section-load-process-live-p "majjic-render")
 (declare-function majjic--sync-rebase-overlays "majjic-render")
 (declare-function majjic--undo-args "majjic-jj")
+(declare-function magit-section-update-highlight "magit-section" (&optional force))
 
 (defface majjic-abandon-included-row
   '((t :inherit shadow :strike-through t))
@@ -934,12 +935,15 @@ Follow Magit's naming style with a repo-specific buffer when possible."
 
 (defun majjic--capture-refresh-state ()
   "Capture the current transient UI state before a refresh."
-  (make-majjic-state
-   :current-commit-id (majjic--current-commit-id)
-   :expanded-commit-ids (majjic--expanded-commit-ids)
-   :expanded-file-keys (majjic--expanded-file-keys)
-   :marked-change-ids majjic--marked-change-ids
-   :rebase-state majjic--rebase-state))
+  (let ((current (majjic--current-revision-section)))
+    (make-majjic-state
+     :current-commit-id (and current (oref current value))
+     :current-change-id (and current (oref current change-id))
+     :commit-change-ids (majjic--commit-change-ids)
+     :expanded-commit-ids (majjic--expanded-commit-ids)
+     :expanded-file-keys (majjic--expanded-file-keys)
+     :marked-change-ids majjic--marked-change-ids
+     :rebase-state majjic--rebase-state)))
 
 (defun majjic--log-refresh-async (state &optional generation)
   "Asynchronously refresh the current buffer, preserving UI STATE.
@@ -958,26 +962,69 @@ operation and ignore stale callbacks from older generations."
     (setq process
           (apply #'majjic--call-jj-capture-async majjic--repo-root
                  (lambda (exit-code stdout stderr)
+                   (majjic--log-refresh-after-snapshot
+                    process refresh-generation state exit-code stdout stderr))
+                 (majjic--refresh-snapshot-args)))
+    (setq majjic--refresh-process process)
+    process))
+
+(defun majjic--refresh-snapshot-args ()
+  "Return args for the cheap jj command that snapshots before refresh."
+  (list "status" "--quiet"))
+
+(defun majjic--log-refresh-after-snapshot
+    (snapshot-process refresh-generation state exit-code stdout stderr)
+  "Continue asynchronous refresh after SNAPSHOT-PROCESS exits."
+  (when (eq snapshot-process majjic--refresh-process)
+    (setq majjic--refresh-process nil))
+  (when (= refresh-generation majjic--process-generation)
+    (if (zerop exit-code)
+        (majjic--start-log-refresh-read state refresh-generation)
+      (majjic--render-refresh-error (majjic--jj-error-message stdout stderr))
+      (majjic--finish-refresh refresh-generation))))
+
+(defun majjic--start-log-refresh-read (state refresh-generation)
+  "Start the read-only log process for asynchronous refresh."
+  (let (process)
+    (setq process
+          (apply #'majjic--call-jj-capture-async majjic--repo-root
+                 (lambda (exit-code stdout stderr)
                    (when (eq process majjic--refresh-process)
                      (setq majjic--refresh-process nil))
                    (when (= refresh-generation majjic--process-generation)
-                     (let ((inhibit-read-only t))
-                       (erase-buffer)
-                       (if (zerop exit-code)
-                           (condition-case err
-                               (majjic--render-records
-                                (majjic--parse-log-output stdout) state)
-                             (error
-                              (majjic--render-error (error-message-string err))))
-                         (majjic--render-error (majjic--jj-error-message stdout stderr)))))
-                   (when (and (= refresh-generation majjic--process-generation)
-                              (not (majjic--operation-process-live-p majjic--refresh-process)))
-                     (setq majjic--mutation-in-progress nil)
-                     (setq majjic--mutation-process nil)
-                     (majjic--set-operation-status nil)))
+                     (if (zerop exit-code)
+                         (condition-case err
+                             (majjic--render-refreshed-records
+                              (majjic--parse-log-output stdout) state)
+                           (error
+                            (majjic--render-refresh-error
+                             (error-message-string err))))
+                       (majjic--render-refresh-error
+                        (majjic--jj-error-message stdout stderr))))
+                   (majjic--finish-refresh refresh-generation))
                  (majjic--log-args)))
     (setq majjic--refresh-process process)
     process))
+
+(defun majjic--render-refreshed-records (records state)
+  "Render refreshed RECORDS, preserving UI STATE."
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (majjic--render-records records state)))
+
+(defun majjic--render-refresh-error (message)
+  "Replace the current buffer with refresh error MESSAGE."
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (majjic--render-error message)))
+
+(defun majjic--finish-refresh (refresh-generation)
+  "Clear async refresh and mutation state for REFRESH-GENERATION when current."
+  (when (and (= refresh-generation majjic--process-generation)
+             (not (majjic--operation-process-live-p majjic--refresh-process)))
+    (setq majjic--mutation-in-progress nil)
+    (setq majjic--mutation-process nil)
+    (majjic--set-operation-status nil)))
 
 (defun majjic--log-refresh-sync (state)
   "Synchronously refresh, preserving UI STATE."
@@ -990,6 +1037,7 @@ operation and ignore stale callbacks from older generations."
 
 (defun majjic--render-records (records state)
   "Render RECORDS and restore UI STATE."
+  (setq state (majjic--remap-refresh-state records state))
   (setq majjic--render-generation (1+ majjic--render-generation))
   (setq majjic--marked-change-ids (majjic-state-marked-change-ids state))
   (setq majjic--abandon-selected-commit-ids nil)
@@ -1010,8 +1058,89 @@ operation and ignore stale callbacks from older generations."
           (when (magit-section-at)
             (magit-section-goto (magit-section-at))))
         (majjic--sync-mark-overlays)
-        (majjic--sync-rebase-overlays))
+        (majjic--sync-rebase-overlays)
+        (majjic--refresh-selection-highlights))
     (majjic--insert-message "No revisions to show.")))
+
+(defun majjic--remap-refresh-state (records state)
+  "Return STATE with commit ids remapped to matching change ids in RECORDS."
+  (let ((remapped (copy-majjic-state state))
+        (commit-ids (majjic--record-commit-ids records))
+        (change-commit-ids (majjic--record-change-commit-ids records)))
+    (setf (majjic-state-current-commit-id remapped)
+          (majjic--remap-state-commit
+           (majjic-state-current-commit-id state)
+           (majjic-state-current-change-id state)
+           commit-ids change-commit-ids))
+    (setf (majjic-state-expanded-commit-ids remapped)
+          (majjic--remap-state-commits
+           (majjic-state-expanded-commit-ids state)
+           (majjic-state-commit-change-ids state)
+           commit-ids change-commit-ids))
+    (setf (majjic-state-expanded-file-keys remapped)
+          (majjic--remap-state-file-keys
+           (majjic-state-expanded-file-keys state)
+           (majjic-state-commit-change-ids state)
+           commit-ids change-commit-ids))
+    remapped))
+
+(defun majjic--record-commit-ids (records)
+  "Return visible revision commit ids from parsed log RECORDS."
+  (let (ids)
+    (dolist (record records)
+      (when (eq (majjic-revision-kind record) 'revision)
+        (push (majjic-revision-commit-id record) ids)))
+    ids))
+
+(defun majjic--record-change-commit-ids (records)
+  "Return an alist of (CHANGE-ID . COMMIT-ID) from parsed log RECORDS."
+  (let (ids)
+    (dolist (record records)
+      (when (eq (majjic-revision-kind record) 'revision)
+        (push (cons (majjic-revision-change-id record)
+                    (majjic-revision-commit-id record))
+              ids)))
+    ids))
+
+(defun majjic--remap-state-commit (commit-id change-id commit-ids change-commit-ids)
+  "Remap COMMIT-ID by CHANGE-ID if it disappeared from COMMIT-IDS."
+  (or (and (member commit-id commit-ids)
+           commit-id)
+      (and change-id
+           (cdr (assoc change-id change-commit-ids)))
+      commit-id))
+
+(defun majjic--remap-state-commits
+    (commit-ids old-commit-change-ids new-commit-ids new-change-commit-ids)
+  "Remap COMMIT-IDS using old and new commit/change alists."
+  (delq nil
+        (delete-dups
+         (mapcar
+          (lambda (commit-id)
+            (majjic--remap-state-commit
+             commit-id
+             (cdr (assoc commit-id old-commit-change-ids))
+             new-commit-ids new-change-commit-ids))
+          commit-ids))))
+
+(defun majjic--remap-state-file-keys
+    (keys old-commit-change-ids new-commit-ids new-change-commit-ids)
+  "Remap expanded file KEYS using old and new commit/change alists."
+  (delq nil
+        (delete-dups
+         (mapcar
+          (lambda (key)
+            (when-let* ((commit-id (majjic--remap-state-commit
+                                    (car key)
+                                    (cdr (assoc (car key) old-commit-change-ids))
+                                    new-commit-ids new-change-commit-ids)))
+              (cons commit-id (cdr key))))
+          keys))))
+
+(defun majjic--refresh-selection-highlights ()
+  "Refresh section highlights after rendering outside `post-command-hook'."
+  (magit-section-update-highlight t)
+  (majjic--update-selected-hunk-heading))
 
 (defun majjic--render-error (message)
   "Render error MESSAGE in the current buffer."
@@ -1163,6 +1292,15 @@ When there are no visible marks, keep the current staged source unchanged."
         (when-let* ((summary (majjic--summary-child revision)))
           (when (not (oref summary hidden))
             (push (oref revision value) ids)))))
+    ids))
+
+(defun majjic--commit-change-ids ()
+  "Return (COMMIT-ID . CHANGE-ID) pairs for currently visible revisions."
+  (let (ids)
+    (when (bound-and-true-p magit-root-section)
+      (dolist (revision (oref magit-root-section children))
+        (when (object-of-class-p revision 'majjic-revision-section)
+          (push (cons (oref revision value) (oref revision change-id)) ids))))
     ids))
 
 (defun majjic--expanded-file-keys ()

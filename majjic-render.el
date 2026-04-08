@@ -397,7 +397,8 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
                            (concat (majjic--file-summary-prefix)
                                    (majjic--jj-error-message stdout stderr)))
                           "\n")))))
-           "diff" "--summary" "--color" "always" "-r" commit-id))
+           "diff" "--summary" "--color" "always" "--ignore-working-copy"
+           "-r" commit-id))
     (majjic--set-section-slot-value section 'load-process process)))
 
 (defun majjic--start-file-diff-load (section commit-id path prefix)
@@ -421,7 +422,8 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
                            (concat (majjic--file-summary-prefix)
                                    (majjic--jj-error-message stdout stderr)))
                           "\n")))))
-           "diff" "--git" "--color" "always" "-r" commit-id "--" path))
+           "diff" "--git" "--color" "always" "--ignore-working-copy"
+           "-r" commit-id "--" path))
     (majjic--set-section-slot-value section 'load-process process)))
 
 (defun majjic--cancel-section-load (section)

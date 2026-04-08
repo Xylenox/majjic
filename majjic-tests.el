@@ -55,6 +55,26 @@
   "Return SECTION's body text without properties."
   (buffer-substring-no-properties (oref section content) (oref section end)))
 
+(defun majjic-test--jj (repo &rest args)
+  "Run jj with ARGS in REPO and return stdout."
+  (with-temp-buffer
+    (let ((default-directory repo))
+      (let ((exit (apply #'process-file "jj" nil t nil args)))
+        (unless (zerop exit)
+          (error "jj %S failed: %s" args (buffer-string)))))
+    (string-trim-right (buffer-string))))
+
+(defun majjic-test--configure-jj-repo (repo)
+  "Configure user identity in the temp jj REPO."
+  (majjic-test--jj repo "config" "set" "--repo" "user.name" "Test User")
+  (majjic-test--jj repo "config" "set" "--repo" "user.email" "test@example.com"))
+
+(defun majjic-test--write-repo-file (repo path contents)
+  "Write CONTENTS to PATH under REPO."
+  (let ((file (expand-file-name path repo)))
+    (make-directory (file-name-directory file) t)
+    (write-region contents nil file nil 'silent)))
+
 (ert-deftest majjic-test-parse-root-and-trailing-elided ()
   "Root revisions should not synthesize a summary, and trailing `~' survives."
   (let* ((sep majjic--record-separator)
@@ -114,6 +134,56 @@
         (majjic--log-refresh-sync (majjic--capture-refresh-state))
         (should (equal (majjic--current-commit-id) selected))
         (should (= (length (majjic--expanded-commit-ids)) 1))))))
+
+(ert-deftest majjic-test-render-refreshes-selection-highlight ()
+  "A rerender should recreate the Magit highlight for the selected row."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((inhibit-read-only t))
+      (majjic--render-records
+       (list (make-majjic-revision
+              :kind 'revision
+              :change-id "change-1"
+              :commit-id "commit-1"
+              :heading "◆ commit-1 test"
+              :summary "test revision"))
+       (make-majjic-state)))
+    (should (majjic--current-revision-section))
+    (should (seq-some
+             (lambda (overlay)
+               (eq (overlay-get overlay 'font-lock-face)
+                   'magit-section-highlight))
+             magit-section-highlight-overlays))))
+
+(ert-deftest majjic-test-refresh-state-remaps-rewritten-current-and-expanded-revisions ()
+  "Refresh state should follow a selected expanded revision after its commit id changes."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((old-record (make-majjic-revision
+                       :kind 'revision
+                       :change-id "change-1"
+                       :commit-id "old-commit"
+                       :heading "◆ old-commit test"
+                       :summary "test revision"))
+          (new-record (make-majjic-revision
+                       :kind 'revision
+                       :change-id "change-1"
+                       :commit-id "new-commit"
+                       :heading "◆ new-commit test"
+                       :summary "test revision"))
+          state)
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir _callback &rest _args)
+                   'summary-process)))
+        (let ((inhibit-read-only t))
+          (majjic--render-records (list old-record) (make-majjic-state)))
+        (majjic-toggle-at-point)
+        (setq state (majjic--capture-refresh-state))
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (majjic--render-records (list new-record) state)))
+      (should (equal (majjic--current-commit-id) "new-commit"))
+      (should (equal (majjic--expanded-commit-ids) '("new-commit"))))))
 
 (ert-deftest majjic-test-current-row-ids-are-explicitly-split ()
   "Current-row state should use commit ids, with change ids stored as section metadata."
@@ -455,12 +525,12 @@
   (with-temp-buffer
     (majjic-log-mode)
     (let ((majjic--repo-root "/tmp/majjic-test")
-          callbacks
+          requests
           rendered)
       (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
-                 (lambda (_dir callback &rest _args)
-                   (push callback callbacks)
-                   (if (= (length callbacks) 1) 'first 'second)))
+                 (lambda (_dir callback &rest args)
+                   (push (cons args callback) requests)
+                   (list 'process (length requests))))
                 ((symbol-function 'majjic--render-records)
                  (lambda (records _state)
                    (setq rendered records)))
@@ -470,11 +540,109 @@
         (majjic-log-refresh)
         (majjic-log-refresh)
         (should (= majjic--process-generation 2))
-        (funcall (nth 1 callbacks) 0 "stale" "")
+        (should (equal (caar requests) (majjic--refresh-snapshot-args)))
+        (funcall (cdr (nth 1 requests)) 0 "stale snapshot" "")
+        (should (= (length requests) 2))
         (should-not rendered)
-        (funcall (nth 0 callbacks) 0 "fresh" "")
+        (funcall (cdar requests) 0 "fresh snapshot" "")
+        (should (= (length requests) 3))
+        (should (equal (caar requests) (majjic--log-args)))
+        (funcall (cdar requests) 0 "fresh" "")
         (should (equal rendered "fresh"))
         (should-not mode-line-process)))))
+
+(ert-deftest majjic-test-async-refresh-renders-snapshot-failure-and-skips-log ()
+  "A failed snapshot preflight should stop refresh before the read-only log."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          requests)
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir callback &rest args)
+                   (push (cons args callback) requests)
+                   (list 'process (length requests)))))
+        (majjic-log-refresh)
+        (funcall (cdar requests) 1 "" "Error: The working copy is stale")
+        (should (= (length requests) 1))
+        (should (string-match-p "working copy is stale"
+                                (buffer-substring-no-properties
+                                 (point-min) (point-max))))
+        (should-not mode-line-process)
+        (should-not majjic--mutation-in-progress)
+        (should-not majjic--refresh-process)))))
+
+(ert-deftest majjic-test-async-refresh-snapshots-working-copy-and-preserves-view ()
+  "Refresh should snapshot disk edits and keep the rewritten `@' selected/expanded."
+  (skip-unless (executable-find "jj"))
+  (let* ((repo (make-temp-file "majjic-refresh-snapshot-" t))
+         (buffer-name (majjic--log-buffer-name repo))
+         (default-directory (file-name-as-directory repo)))
+    (unwind-protect
+        (progn
+          (majjic-test--jj repo "git" "init" ".")
+          (majjic-test--configure-jj-repo repo)
+          (majjic-test--jj repo "describe" "-m" "snapshot target")
+          (majjic-test--write-repo-file repo "tracked.txt" "one\n")
+          (majjic-test--jj repo "status")
+          (majjic)
+          (with-current-buffer buffer-name
+            (let* ((old-commit-id (majjic--current-commit-id))
+                   (change-id (oref (majjic--current-revision-section) change-id)))
+              (majjic-toggle-at-point)
+              (majjic-test--wait-for-idle)
+              (should (equal (majjic--expanded-commit-ids) (list old-commit-id)))
+              (majjic-test--write-repo-file repo "tracked.txt" "one\ntwo\n")
+              (majjic-log-refresh)
+              (majjic-test--wait-for-idle)
+              (let ((new-commit-id (majjic--current-commit-id)))
+                (should-not (equal new-commit-id old-commit-id))
+                (should (equal (oref (majjic--current-revision-section) change-id)
+                               change-id))
+                (should (equal (majjic--expanded-commit-ids) (list new-commit-id))))
+              (majjic-test--wait-for
+               (lambda ()
+                 (save-excursion
+                   (goto-char (point-min))
+                   (search-forward "tracked.txt" nil t)))))))
+      (when-let* ((buffer (get-buffer buffer-name)))
+        (kill-buffer buffer)))))
+
+(ert-deftest majjic-test-async-refresh-surfaces-stale-workspace-without-updating-it ()
+  "Refresh should surface stale workspaces and not run workspace recovery."
+  (skip-unless (executable-find "jj"))
+  (let* ((base (make-temp-file "majjic-refresh-stale-" t))
+         (main (expand-file-name "main" base))
+         (other (expand-file-name "other" base))
+         (buffer-name (majjic--log-buffer-name other))
+         (local-only (expand-file-name "local-only.txt" other)))
+    (make-directory main)
+    (unwind-protect
+        (let ((default-directory (file-name-as-directory other)))
+          (majjic-test--jj main "git" "init" ".")
+          (majjic-test--configure-jj-repo main)
+          (majjic-test--jj main "describe" "-m" "main workspace")
+          (majjic-test--write-repo-file main "main.txt" "one\n")
+          (majjic-test--jj main "status")
+          (majjic-test--jj main "workspace" "add" "../other")
+          (majjic-test--jj main "rebase" "-r" "other@" "-d" "default@")
+          (majjic-test--jj other "workspace" "update-stale")
+          (majjic-test--write-repo-file other "other.txt" "other\n")
+          (majjic-test--jj other "status")
+          (majjic)
+          (with-current-buffer buffer-name
+            (should (majjic--current-commit-id)))
+          (majjic-test--write-repo-file main "main.txt" "one\ntwo\n")
+          (majjic-test--jj main "status")
+          (majjic-test--write-repo-file other "local-only.txt" "do not delete\n")
+          (with-current-buffer buffer-name
+            (majjic-log-refresh)
+            (majjic-test--wait-for-idle)
+            (should (string-match-p "working copy is stale"
+                                    (buffer-substring-no-properties
+                                     (point-min) (point-max)))))
+          (should (file-exists-p local-only)))
+      (when-let* ((buffer (get-buffer buffer-name)))
+        (kill-buffer buffer)))))
 
 (ert-deftest majjic-test-async-mutation-serializes-in-flight-commands ()
   "A second mutation should be rejected while the first async process is live."
@@ -505,10 +673,10 @@
   (with-temp-buffer
     (majjic-log-mode)
     (let ((majjic--repo-root "/tmp/majjic-test")
-          callbacks)
+          requests)
       (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
-                 (lambda (_dir callback &rest _args)
-                   (push callback callbacks)
+                 (lambda (_dir callback &rest args)
+                   (push (cons args callback) requests)
                    'summary-process)))
         (let ((inhibit-read-only t))
           (majjic--render-records
@@ -521,8 +689,9 @@
            (make-majjic-state)))
         (goto-char (point-min))
         (majjic-toggle-at-point)
-        (should (= (length callbacks) 1))
-        (funcall (car callbacks) 0 "M file.txt\n" "")
+        (should (= (length requests) 1))
+        (should (member "--ignore-working-copy" (caar requests)))
+        (funcall (cdar requests) 0 "M file.txt\n" "")
         (let* ((revision (majjic--current-revision-section))
                (summary (majjic--summary-child revision))
                (file (car (oref summary children))))
@@ -643,10 +812,10 @@
   (with-temp-buffer
     (majjic-log-mode)
     (let ((majjic--repo-root "/tmp/majjic-test")
-          callbacks)
+          requests)
       (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
                  (lambda (_dir callback &rest args)
-                   (push (cons (car args) callback) callbacks)
+                   (push (cons args callback) requests)
                    (car args))))
         (let ((inhibit-read-only t))
           (majjic--render-records
@@ -659,10 +828,12 @@
            (make-majjic-state)))
         (goto-char (point-min))
         (majjic-toggle-at-point)
-        (funcall (cdar callbacks) 0 "M file.txt\n" "")
+        (should (member "--ignore-working-copy" (caar requests)))
+        (funcall (cdar requests) 0 "M file.txt\n" "")
         (majjic-section-forward)
         (majjic-toggle-at-point)
-        (funcall (cdar callbacks) 0 "@@ -1 +1 @@\n-old\n+new\n" "")
+        (should (member "--ignore-working-copy" (caar requests)))
+        (funcall (cdar requests) 0 "@@ -1 +1 @@\n-old\n+new\n" "")
         (let* ((file (majjic--current-file-section))
                (hunk (car (oref file children))))
           (should (object-of-class-p hunk 'majjic-hunk-section))

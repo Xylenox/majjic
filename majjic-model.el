@@ -20,6 +20,8 @@
 (cl-defstruct majjic-state
   "Captured UI state for a `majjic' refresh."
   current-commit-id
+  current-change-id
+  commit-change-ids
   expanded-commit-ids
   expanded-file-keys
   marked-change-ids
