@@ -116,12 +116,15 @@ When nil, render every row from `jj diff --summary'."
 
 (declare-function majjic--clear-rebase-overlays "majjic-render")
 (declare-function majjic--change-id-for-commit-id "majjic-jj")
+(declare-function majjic--call-jj-capture "majjic-jj")
 (declare-function majjic--call-jj-capture-async "majjic-jj")
 (declare-function majjic--commit-id-for-change-id "majjic-jj")
 (declare-function majjic--describe-args "majjic-jj")
 (declare-function majjic--effective-redo-operation-preview "majjic-jj")
 (declare-function majjic--effective-undo-operation-preview "majjic-jj")
+(declare-function majjic--git-push-change-args "majjic-jj")
 (declare-function majjic--git-push-preview-result-async "majjic-jj")
+(declare-function majjic--git-push-revision-args "majjic-jj")
 (declare-function majjic--jj-error-message "majjic-jj")
 (declare-function majjic--log-args "majjic-jj")
 (declare-function majjic--operation-process-live-p "majjic-jj")
@@ -193,10 +196,15 @@ When nil, render every row from `jj diff --summary'."
   "f" #'majjic-git-fetch
   "t" #'majjic-git-fetch-tracked)
 
+(defvar-keymap majjic-git-push-map
+  :doc "Subcommands for `jj git push' in `majjic-log-mode'."
+  "c" #'majjic-git-push-change
+  "p" #'majjic-git-push)
+
 (defvar-keymap majjic-git-map
   :doc "Prefix map for Git-backed remote operations in `majjic-log-mode'."
   "f" majjic-git-fetch-map
-  "p" #'majjic-git-push)
+  "p" majjic-git-push-map)
 
 (defvar-keymap majjic-section-map
   :parent magit-section-mode-map
@@ -460,10 +468,10 @@ When TRACKED is non-nil, fetch only tracked bookmarks."
   (interactive)
   (majjic-git-fetch t))
 
-(defun majjic-git-push ()
-  "Push marked visible revisions, or the current revision, by change.
-Ask for confirmation after a dry-run preview."
-  (interactive)
+(defun majjic--git-push-selected (args-function confirm-prompt push-status)
+  "Push selected revisions after previewing with ARGS-FUNCTION.
+CONFIRM-PROMPT is passed to `majjic--confirm-preview'.  PUSH-STATUS is
+shown while the confirmed push runs."
   (majjic--require-no-operation-in-progress)
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
@@ -478,17 +486,18 @@ Ask for confirmation after a dry-run preview."
           (setq process
                 (majjic--git-push-preview-result-async
                  commit-ids
+                 args-function
                  (lambda (exit-code preview)
                    (setq preview-finished t)
                    (setq majjic--preview-in-progress nil)
                    (setq majjic--preview-process nil)
                    (majjic--set-operation-status nil)
                    (if (zerop exit-code)
-                       (when (majjic--confirm-preview "push" preview "Push selected changes? ")
-                         (majjic--status-message "Pushing selected changes...")
+                       (when (majjic--confirm-preview "push" preview confirm-prompt)
+                         (majjic--status-message push-status)
                          (majjic--run-mutation
                           (lambda ()
-                            (majjic--git-push-change-args commit-ids))))
+                            (funcall args-function commit-ids))))
                      (majjic--show-preview "push" preview "Git push dry-run failed; press any key to close")
                      (message "Git push dry-run failed")))))
           (unless preview-finished
@@ -498,6 +507,24 @@ Ask for confirmation after a dry-run preview."
        (setq majjic--preview-process nil)
        (majjic--set-operation-status nil)
        (signal (car err) (cdr err))))))
+
+(defun majjic-git-push-change ()
+  "Push marked visible revisions, or the current revision, by change.
+Ask for confirmation after a dry-run preview."
+  (interactive)
+  (majjic--git-push-selected
+   #'majjic--git-push-change-args
+   "Push selected changes? "
+   "Pushing selected changes..."))
+
+(defun majjic-git-push ()
+  "Push marked visible revisions, or the current revision, by revision.
+Ask for confirmation after a dry-run preview."
+  (interactive)
+  (majjic--git-push-selected
+   #'majjic--git-push-revision-args
+   "Push selected revisions? "
+   "Pushing selected revisions..."))
 
 (defun majjic-abandon-start ()
   "Abandon marked visible revisions after confirmation.
@@ -972,6 +999,15 @@ operation and ignore stale callbacks from older generations."
   "Return args for the cheap jj command that snapshots before refresh."
   (list "status" "--quiet"))
 
+(defun majjic--snapshot-before-refresh-sync ()
+  "Ask jj to snapshot before a synchronous refresh."
+  (pcase-let ((`(,exit-code ,stdout ,stderr)
+               (apply #'majjic--call-jj-capture
+                      majjic--repo-root
+                      (majjic--refresh-snapshot-args))))
+    (unless (zerop exit-code)
+      (error "%s" (majjic--jj-error-message stdout stderr)))))
+
 (defun majjic--log-refresh-after-snapshot
     (snapshot-process refresh-generation state exit-code stdout stderr)
   "Continue asynchronous refresh after SNAPSHOT-PROCESS exits."
@@ -1027,11 +1063,13 @@ operation and ignore stale callbacks from older generations."
     (majjic--set-operation-status nil)))
 
 (defun majjic--log-refresh-sync (state)
-  "Synchronously refresh, preserving UI STATE."
+  "Synchronously snapshot and refresh, preserving UI STATE."
   (let ((inhibit-read-only t))
     (erase-buffer)
     (condition-case err
-        (majjic--render-records (majjic--read-log-records) state)
+        (progn
+          (majjic--snapshot-before-refresh-sync)
+          (majjic--render-records (majjic--read-log-records) state))
       (error
        (majjic--render-error (error-message-string err))))))
 

@@ -25,7 +25,8 @@ https://github.com/user-attachments/assets/9da48e9c-72da-463d-91a3-b97fefcf597d
 - `U` redo the latest undone operation after confirming a full op-log peek
 - `G f f` fetch from the configured Git remote and refresh
 - `G f t` fetch only tracked bookmarks from the configured Git remote and refresh
-- `G p` push the marked visible revisions, or the current revision if none are marked, by `jj git push --change` after a dry-run confirmation
+- `G p c` push the marked visible revisions, or the current revision if none are marked, by `jj git push --change` after a dry-run confirmation
+- `G p p` push bookmarks pointing at the marked visible revisions, or the current revision if none are marked, by `jj git push --revision` after a dry-run confirmation
 - Mutations and `g` refresh run asynchronously; while one is in flight, navigation, snapshots, and lazy diff expansion stay available, but marks, rebase edits, and refresh are blocked
 - `O` reserved for an op-log browser
 - `B` reserved for a bookmark browser

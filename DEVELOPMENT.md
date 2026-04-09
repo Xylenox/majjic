@@ -23,7 +23,8 @@ Minimal Emacs UI for browsing `jj log`.
 - `U` redoes the latest undone operation after confirming a full op-log peek.
 - `G f f` fetches from the configured Git remote and refreshes.
 - `G f t` fetches only tracked bookmarks from the configured Git remote and refreshes.
-- `G p` pushes the marked visible revisions, or the current revision if none are marked, by `jj git push --change` after a dry-run confirmation.
+- `G p c` pushes the marked visible revisions, or the current revision if none are marked, by `jj git push --change` after a dry-run confirmation.
+- `G p p` pushes bookmarks pointing at the marked visible revisions, or the current revision if none are marked, by `jj git push --revision` after a dry-run confirmation.
 - Mutations and `g` refresh run asynchronously; while one is in flight, navigation, snapshots, and lazy diff expansion stay available, but marks, rebase edits, and refresh are blocked.
 - `O` is reserved for a dedicated op-log browser.
 - `B` is reserved for a dedicated bookmark browser.

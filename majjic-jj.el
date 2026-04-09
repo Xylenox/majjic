@@ -307,26 +307,38 @@ When DRY-RUN is non-nil, include `--dry-run'."
    (when dry-run
      (list "--dry-run"))))
 
-(defun majjic--git-push-preview (commit-ids)
-  "Return colored dry-run output for pushing COMMIT-IDS by change."
-  (pcase-let ((`(,exit-code ,output) (majjic--git-push-preview-result commit-ids)))
+(defun majjic--git-push-revision-args (commit-ids &optional dry-run)
+  "Return `jj git push --revision' arguments for COMMIT-IDS.
+When DRY-RUN is non-nil, include `--dry-run'."
+  (append
+   (list "git" "push")
+   (cl-mapcan (lambda (commit-id) (list "--revision" commit-id)) commit-ids)
+   (when dry-run
+     (list "--dry-run"))))
+
+(defun majjic--git-push-preview (commit-ids args-function)
+  "Return colored dry-run output for pushing COMMIT-IDS with ARGS-FUNCTION."
+  (pcase-let ((`(,exit-code ,output)
+               (majjic--git-push-preview-result commit-ids args-function)))
     (if (zerop exit-code)
         output
       (error "%s" output))))
 
-(defun majjic--git-push-preview-result (commit-ids)
-  "Return (EXIT-CODE OUTPUT) for a colored dry-run push of COMMIT-IDS."
+(defun majjic--git-push-preview-result (commit-ids args-function)
+  "Return (EXIT-CODE OUTPUT) for a colored dry-run push.
+ARGS-FUNCTION builds `jj git push' args for COMMIT-IDS."
   (pcase-let* ((`(,exit-code ,stdout ,stderr)
                 (apply #'majjic--call-jj-capture majjic--repo-root
                        (append
-                        (majjic--git-push-change-args commit-ids t)
+                        (funcall args-function commit-ids t)
                         (list "--color" "always" "--no-pager"))))
                (output (string-trim-right
                         (if (string-blank-p stdout) stderr stdout))))
     (list exit-code output)))
 
-(defun majjic--git-push-preview-result-async (commit-ids callback)
-  "Run a colored dry-run push for COMMIT-IDS and invoke CALLBACK on exit.
+(defun majjic--git-push-preview-result-async (commit-ids args-function callback)
+  "Run a colored dry-run push and invoke CALLBACK on exit.
+ARGS-FUNCTION builds `jj git push' args for COMMIT-IDS.
 CALLBACK receives (EXIT-CODE OUTPUT)."
   (apply #'majjic--call-jj-capture-async majjic--repo-root
          (lambda (exit-code stdout stderr)
@@ -335,7 +347,7 @@ CALLBACK receives (EXIT-CODE OUTPUT)."
                     (string-trim-right
                      (if (string-blank-p stdout) stderr stdout))))
          (append
-          (majjic--git-push-change-args commit-ids t)
+          (funcall args-function commit-ids t)
           (list "--color" "always" "--no-pager"))))
 
 (defun majjic--op-log-preview (&optional limit)
