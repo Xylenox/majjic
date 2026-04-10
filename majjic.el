@@ -22,6 +22,7 @@
 (require 'magit-section)
 (require 'seq)
 (require 'subr-x)
+(require 'uniquify)
 (require 'majjic-model)
 
 (defgroup majjic nil
@@ -363,7 +364,10 @@ section bindings that would otherwise page the buffer."
   "Open a Jujutsu log buffer for the current repository.
 When DIRECTORY is non-nil, start repository discovery there.
 If the current directory is not inside a Jujutsu repository, prompt for one."
-  (interactive)
+  (interactive
+   (list (when current-prefix-arg
+           (read-directory-name "Open Jujutsu repository: "
+                                default-directory nil t))))
   (let* ((source-dir (file-name-as-directory (expand-file-name (or directory default-directory))))
          (repo-root (or (majjic--locate-root source-dir)
                         (let* ((picked-dir
@@ -377,11 +381,12 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
                                         (abbreviate-file-name picked-dir)))
                           (setq source-dir picked-dir)
                           picked-root)))
-         (buffer (get-buffer-create (majjic--log-buffer-name repo-root))))
+         (buffer (majjic--get-log-buffer repo-root)))
     (with-current-buffer buffer
       (majjic-log-mode)
       (setq default-directory source-dir)
       (setq majjic--repo-root repo-root)
+      (setq list-buffers-directory (abbreviate-file-name repo-root))
       (majjic--log-refresh-sync (majjic--capture-refresh-state)))
     (pop-to-buffer buffer)))
 
@@ -1102,6 +1107,44 @@ Follow Magit's naming style with a repo-specific buffer when possible."
       (format "majjic: %s"
               (file-name-nondirectory (directory-file-name repo-root)))
     "majjic"))
+
+(defun majjic--get-log-buffer (repo-root)
+  "Return the existing log buffer for REPO-ROOT, or create one."
+  (or (majjic--find-log-buffer repo-root)
+      (majjic--generate-log-buffer repo-root)))
+
+(defun majjic--find-log-buffer (repo-root)
+  "Return the existing Majjic log buffer for REPO-ROOT, if any."
+  (seq-find
+   (lambda (buffer)
+     (with-current-buffer buffer
+       (and (derived-mode-p 'majjic-log-mode)
+            (equal majjic--repo-root repo-root))))
+   (buffer-list)))
+
+(defun majjic--generate-log-buffer (repo-root)
+  "Create a Majjic log buffer for REPO-ROOT.
+When multiple repositories have the same basename, use Magit's
+`uniquify' style and append distinguishing path components in
+angle brackets."
+  (let* ((default-directory (file-name-as-directory repo-root))
+         (name (majjic--log-buffer-name repo-root))
+         (buffer (generate-new-buffer name)))
+    (with-current-buffer buffer
+      (setq default-directory default-directory)
+      (setq list-buffers-directory (abbreviate-file-name default-directory)))
+    (majjic--maybe-uniquify-log-buffer-name buffer name repo-root)
+    buffer))
+
+(defun majjic--maybe-uniquify-log-buffer-name (buffer name repo-root)
+  "Uniquify BUFFER named NAME using REPO-ROOT, following Magit."
+  (cl-pushnew 'majjic-log-mode uniquify-list-buffers-directory-modes)
+  (let ((uniquify-buffer-name-style
+         (if (memq uniquify-buffer-name-style '(nil forward))
+             'post-forward-angle-brackets
+           uniquify-buffer-name-style)))
+    (uniquify-rationalize-file-buffer-names
+     name (file-name-directory (directory-file-name repo-root)) buffer)))
 
 (defun majjic--capture-refresh-state ()
   "Capture the current transient UI state before a refresh."
