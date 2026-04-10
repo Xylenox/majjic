@@ -18,7 +18,7 @@ Minimal Emacs UI for browsing `jj log`.
 - `SPC` toggles a persistent mark on the current revision and moves to the next revision.
 - `M` clears all marks.
 - `a` abandons the currently marked revisions after confirmation.
-- `r` enters rebase mode using marked revisions as the source, or the current revision if none are marked; `o` / `a` / `b` choose onto / after / before, `RET` applies, and `C-g` cancels.
+- `r` enters rebase mode using marked revisions as the source, or the current revision if none are marked; `s` selects source descendants, `o` / `a` / `b` choose onto / after / before, `RET` applies, and `C-g` cancels.
 - `s` enters squash mode using marked revisions as the source, or the current revision if none are marked; Majjic selects the common parent as the initial destination when available, `RET` applies, and `C-g` cancels.
 - `u` undoes the latest operation after confirming a full op-log peek.
 - `U` redoes the latest undone operation after confirming a full op-log peek.
@@ -26,10 +26,27 @@ Minimal Emacs UI for browsing `jj log`.
 - `G f t` fetches only tracked bookmarks from the configured Git remote and refreshes.
 - `G p c` pushes the marked visible revisions, or the current revision if none are marked, by `jj git push --change` after a dry-run confirmation.
 - `G p p` pushes bookmarks pointing at the marked visible revisions, or the current revision if none are marked, by `jj git push --revision` after a dry-run confirmation.
+- `:` opens a completion prompt for configured Majjic custom commands.
 - Mutations and `g` refresh run asynchronously; while one is in flight, navigation, snapshots, and lazy diff expansion stay available, but marks, rebase edits, and refresh are blocked.
 - `O` is reserved for a dedicated op-log browser.
 - `B` is reserved for a dedicated bookmark browser.
 - `g` refreshes.
+
+Custom commands are configured with `majjic-custom-commands`.  Each command is a
+plist with a unique `:name`, a required `:command` argv template, and optional
+`:preview`, `:confirm`, `:status`, and `:refresh` entries.  Templates support
+`:revset` for the selected visible revisions as one revset argument and
+`(:revisions PREFIX)` for repeated revision arguments.
+
+```elisp
+(setq majjic-custom-commands
+      '((:name "Graphite submit"
+         :command ("gt-submit" "-r" :revset)
+         :preview ("gt-submit" "--dry-run" "-r" :revset)
+         :confirm "Submit selected revision with Graphite? "
+         :status "Submitting selected revision..."
+         :refresh t)))
+```
 
 ## Loading
 

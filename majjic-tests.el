@@ -388,6 +388,40 @@
   (should (equal (majjic--rebase-args '("src1" "src2") "dst" 'onto)
                  '("rebase" "--revisions" "src1" "--revisions" "src2" "--onto" "dst"))))
 
+(ert-deftest majjic-test-rebase-section-s-key-selects-descendants ()
+  "Section-level `s' should keep working as source-descendants in rebase mode."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test"))
+      (let ((inhibit-read-only t))
+        (majjic--render-records
+         (list (make-majjic-revision
+                :kind 'revision
+                :change-id "change-1"
+                :commit-id "commit-1"
+                :heading "◆ commit-1 one"
+                :summary "one"))
+         (make-majjic-state)))
+      (setq majjic--rebase-state
+            (make-majjic-rebase-state
+             :source-change-id "change-1"
+             :source-mode 'revision
+             :moved-change-ids '("change-1")
+             :target-mode 'onto))
+      (majjic-rebase-mode 1)
+      (should (eq (key-binding (kbd "s"))
+                  #'majjic-squash-or-rebase-source-descendants))
+      (cl-letf (((symbol-function 'majjic--rebase-moved-change-ids)
+                 (lambda (source mode)
+                   (should (equal source "change-1"))
+                   (should (eq mode 'descendants))
+                   '("change-1" "child-change"))))
+        (call-interactively (key-binding (kbd "s"))))
+      (should (eq (majjic-rebase-state-source-mode majjic--rebase-state)
+                  'descendants))
+      (should (equal (majjic-rebase-state-moved-change-ids majjic--rebase-state)
+                     '("change-1" "child-change"))))))
+
 (ert-deftest majjic-test-describe-command-args-description-and-binding ()
   "Describe helpers should build args, read descriptions, and bind to `d'."
   (should (equal (majjic--describe-args "commit-1" "hello")
@@ -469,7 +503,8 @@
                    "--into" "dest" "--use-destination-message")))
   (with-temp-buffer
     (majjic-log-mode)
-    (should (eq (key-binding (kbd "s")) #'majjic-squash-start))
+    (should (eq (key-binding (kbd "s"))
+                #'majjic-squash-or-rebase-source-descendants))
     (let ((majjic--repo-root "/tmp/majjic-test"))
       (let ((inhibit-read-only t))
         (majjic--render-records
@@ -707,7 +742,141 @@
     (should (eq (key-binding (kbd "G f t")) #'majjic-git-fetch-tracked))
     (should (eq (key-binding (kbd "G p c")) #'majjic-git-push-change))
     (should (eq (key-binding (kbd "G p p")) #'majjic-git-push))
+    (should (eq (key-binding (kbd ":")) #'majjic-run-custom-command))
     (should (eq (key-binding (kbd "p")) #'majjic-section-backward))))
+
+(ert-deftest majjic-test-custom-command-validation-and-expansion ()
+  "Custom commands should validate names and expand selection placeholders."
+  (let ((majjic-custom-commands nil))
+    (should-error (majjic--validated-custom-commands) :type 'user-error))
+  (let ((majjic-custom-commands '((:name "one" :command ("log"))
+                                  (:name "one" :command ("status")))))
+    (should-error (majjic--validated-custom-commands) :type 'user-error))
+  (let ((majjic-custom-commands '((:command ("log")))))
+    (should-error (majjic--validated-custom-commands) :type 'user-error))
+  (should (equal (majjic--expand-custom-command-template
+                  '("gt-submit" "-r" :revset)
+                  '("c1" "c2"))
+                 '("gt-submit" "-r" "c1 | c2")))
+  (should (equal (majjic--expand-custom-command-template
+                  '("git" "push" (:revisions "--revision"))
+                  '("c1" "c2"))
+                 '("git" "push" "--revision" "c1" "--revision" "c2")))
+  (should-error (majjic--expand-custom-command-template
+                 '("git" (:revisions))
+                 '("c1"))
+                :type 'user-error)
+  (should-error (majjic--custom-command-expanded-args
+                 '(:name "broken") :command '("c1"))
+                :type 'user-error))
+
+(ert-deftest majjic-test-custom-command-selection-and-completion ()
+  "Custom command prompt should use names and fall back from marks to current."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic-custom-commands '((:name "Graphite submit"
+                                     :command ("gt-submit" "-r" :revset))))
+          selected
+          args)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _args)
+                   (setq selected collection)
+                   "Graphite submit"))
+                ((symbol-function 'majjic--marked-visible-commit-ids)
+                 (lambda () nil))
+                ((symbol-function 'majjic--require-current-commit-id)
+                 (lambda () "current"))
+                ((symbol-function 'majjic--run-mutation)
+                 (lambda (command &rest _args)
+                   (setq args (funcall command)))))
+        (call-interactively #'majjic-run-custom-command)
+        (should (equal selected '("Graphite submit")))
+        (should (equal args '("gt-submit" "-r" "current")))))))
+
+(ert-deftest majjic-test-custom-command-confirmation-flow ()
+  "Custom commands should preview, honor confirmation, and run expanded args."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          (majjic-custom-commands '((:name "Graphite submit"
+                                     :command ("gt-submit" "-r" :revset)
+                                     :preview ("gt-submit" "--dry-run" "-r" :revset)
+                                     :confirm "Submit? "
+                                     :status "Submitting..."
+                                     :refresh nil)))
+          preview-args
+          ran
+          mutation-refresh)
+      (cl-letf* (((symbol-function 'majjic--marked-visible-commit-ids)
+                  (lambda () '("c1" "c2")))
+                 ((symbol-function 'majjic--custom-command-preview-result-async)
+                  (lambda (args callback)
+                    (setq preview-args args)
+                    (funcall callback 0 "dry-run")))
+                 ((symbol-function 'majjic--confirm-preview)
+                  (lambda (_action _preview _prompt) nil))
+                 ((symbol-function 'majjic--run-mutation)
+                  (lambda (&rest _args)
+                    (setq ran t))))
+        (majjic-run-custom-command "Graphite submit")
+        (should (equal preview-args '("gt-submit" "--dry-run" "-r" "c1 | c2")))
+        (should-not ran))
+      (setq preview-args nil
+            ran nil)
+      (cl-letf* (((symbol-function 'majjic--marked-visible-commit-ids)
+                  (lambda () '("c1" "c2")))
+                 ((symbol-function 'majjic--custom-command-preview-result-async)
+                  (lambda (args callback)
+                    (setq preview-args args)
+                    (funcall callback 0 "dry-run")))
+                 ((symbol-function 'majjic--confirm-preview)
+                  (lambda (_action _preview _prompt) t))
+                 ((symbol-function 'majjic--run-mutation)
+                  (lambda (command &rest plist)
+                    (setq ran (funcall command))
+                    (setq mutation-refresh (plist-get plist :refresh)))))
+        (majjic-run-custom-command "Graphite submit")
+        (should (equal preview-args '("gt-submit" "--dry-run" "-r" "c1 | c2")))
+        (should (equal ran '("gt-submit" "-r" "c1 | c2")))
+        (should-not mutation-refresh)))))
+
+(ert-deftest majjic-test-custom-command-preview-failure-and-blocking ()
+  "Custom command preview failures should not mutate and previews should block."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          (majjic-custom-commands '((:name "Graphite submit"
+                                     :command ("gt-submit" "-r" :revset)
+                                     :preview ("gt-submit" "--dry-run" "-r" :revset))))
+          failed-preview
+          ran)
+      (cl-letf* (((symbol-function 'majjic--marked-visible-commit-ids)
+                  (lambda () '("bad")))
+                 ((symbol-function 'majjic--custom-command-preview-result-async)
+                  (lambda (_args callback)
+                    (funcall callback 1 "\e[31mError\e[0m")))
+                 ((symbol-function 'majjic--show-preview)
+                  (lambda (_action preview _prompt)
+                    (setq failed-preview preview)))
+                 ((symbol-function 'majjic--run-mutation)
+                  (lambda (&rest _args)
+                    (setq ran t))))
+        (majjic-run-custom-command "Graphite submit")
+        (should (equal failed-preview "\e[31mError\e[0m"))
+        (should-not ran))
+      (unwind-protect
+          (cl-letf* (((symbol-function 'majjic--marked-visible-commit-ids)
+                      (lambda () '("c1")))
+                     ((symbol-function 'majjic--custom-command-preview-result-async)
+                      (lambda (_args _callback)
+                        'preview-process)))
+            (majjic-run-custom-command "Graphite submit")
+            (should majjic--preview-in-progress)
+            (should (eq majjic--preview-process 'preview-process))
+            (should-error (majjic-git-fetch) :type 'user-error))
+        (setq majjic--preview-in-progress nil)
+        (setq majjic--preview-process nil)
+        (majjic--set-operation-status nil)))))
 
 (ert-deftest majjic-test-git-push-confirmation-flow ()
   "Push should preview, honor decline, and execute on confirmation."

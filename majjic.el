@@ -61,6 +61,24 @@ When nil, render every row from `jj diff --summary'."
                  natnum)
   :group 'majjic)
 
+(defcustom majjic-custom-commands nil
+  "Custom Majjic commands available from `majjic-run-custom-command'.
+Each entry is a plist with these keys:
+
+:name is the unique display name used for completion.
+:command is the argv template passed to `majjic-program'.
+:preview is an optional argv template to run before `:command'.
+:confirm is an optional prompt shown before running `:command'.
+:status is an optional status message shown while `:command' runs.
+:refresh controls whether Majjic refreshes after success, defaulting to t.
+
+Templates are lists of strings and placeholders.  The `:revset' placeholder
+expands to one argument containing the selected revisions as a revset.
+The `(:revisions PREFIX)' placeholder expands to repeated PREFIX/revision
+argument pairs."
+  :type '(repeat sexp)
+  :group 'majjic)
+
 (defconst majjic--record-separator "\x1f"
   "Separator used to mark revision records in `jj log' output.")
 
@@ -233,10 +251,11 @@ When nil, render every row from `jj diff --summary'."
   "B" #'majjic-bookmark-browser
   "a" #'majjic-abandon-start
   "r" #'majjic-rebase-start
-  "s" #'majjic-squash-start
+  "s" #'majjic-squash-or-rebase-source-descendants
   "u" #'majjic-undo
   "U" #'majjic-redo
   "G" majjic-git-map
+  ":" #'majjic-run-custom-command
   "<wheel-up>" #'majjic-mwheel-scroll
   "<wheel-down>" #'majjic-mwheel-scroll
   "<mouse-4>" #'majjic-mwheel-scroll
@@ -333,10 +352,11 @@ When nil, render every row from `jj diff --summary'."
 (keymap-set majjic-log-mode-map "B" #'majjic-bookmark-browser)
 (keymap-set majjic-log-mode-map "a" #'majjic-abandon-start)
 (keymap-set majjic-log-mode-map "r" #'majjic-rebase-start)
-(keymap-set majjic-log-mode-map "s" #'majjic-squash-start)
+(keymap-set majjic-log-mode-map "s" #'majjic-squash-or-rebase-source-descendants)
 (keymap-set majjic-log-mode-map "u" #'majjic-undo)
 (keymap-set majjic-log-mode-map "U" #'majjic-redo)
 (keymap-set majjic-log-mode-map "G" majjic-git-map)
+(keymap-set majjic-log-mode-map ":" #'majjic-run-custom-command)
 (keymap-set majjic-log-mode-map "<wheel-up>" #'majjic-mwheel-scroll)
 (keymap-set majjic-log-mode-map "<wheel-down>" #'majjic-mwheel-scroll)
 (keymap-set majjic-log-mode-map "<mouse-4>" #'majjic-mwheel-scroll)
@@ -498,6 +518,154 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
   (apply #'message message args)
   (redisplay))
 
+(defun majjic-run-custom-command (name)
+  "Run the custom Majjic command named NAME."
+  (interactive (list (majjic--read-custom-command-name)))
+  (let ((command (majjic--custom-command-by-name name)))
+    (majjic--run-custom-command command)))
+
+(defun majjic--read-custom-command-name ()
+  "Read a custom command name from the minibuffer."
+  (let ((commands (majjic--validated-custom-commands)))
+    (completing-read "Majjic command: "
+                     (mapcar (lambda (command) (plist-get command :name))
+                             commands)
+                     nil t)))
+
+(defun majjic--validated-custom-commands ()
+  "Return `majjic-custom-commands' after validating their names."
+  (unless majjic-custom-commands
+    (user-error "No Majjic custom commands configured"))
+  (let ((names nil))
+    (dolist (command majjic-custom-commands)
+      (let ((name (plist-get command :name)))
+        (unless (and (stringp name) (not (string-empty-p name)))
+          (user-error "Majjic custom command is missing a string :name"))
+        (when (member name names)
+          (user-error "Duplicate Majjic custom command name: %s" name))
+        (push name names)))
+    majjic-custom-commands))
+
+(defun majjic--custom-command-by-name (name)
+  "Return the custom command named NAME."
+  (or (seq-find (lambda (command)
+                  (equal (plist-get command :name) name))
+                (majjic--validated-custom-commands))
+      (user-error "No Majjic custom command named: %s" name)))
+
+(defun majjic--run-custom-command (command)
+  "Run custom COMMAND from `majjic-custom-commands'."
+  (majjic--require-no-operation-in-progress)
+  (when majjic-rebase-mode
+    (majjic-rebase-disabled-command))
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
+  (let* ((name (plist-get command :name))
+         (commit-ids (majjic--selected-command-commit-ids))
+         (command-args (majjic--custom-command-expanded-args command :command commit-ids))
+         (preview-args (majjic--custom-command-expanded-args command :preview commit-ids t))
+         (confirm (plist-get command :confirm)))
+    (if preview-args
+        (majjic--run-custom-command-with-preview command command-args preview-args confirm)
+      (when (or (null confirm) (y-or-n-p confirm))
+        (majjic--start-custom-command command command-args)))))
+
+(defun majjic--selected-command-commit-ids ()
+  "Return visible marked commit ids, or the current commit id."
+  (or (majjic--marked-visible-commit-ids)
+      (list (majjic--require-current-commit-id))))
+
+(defun majjic--custom-command-expanded-args (command key commit-ids &optional optional)
+  "Return expanded argv for COMMAND's KEY using COMMIT-IDS.
+When OPTIONAL is non-nil, return nil if KEY is absent."
+  (let ((template (plist-get command key)))
+    (cond
+     ((and optional (null template)) nil)
+     ((null template)
+      (user-error "Majjic custom command %s is missing %s"
+                  (plist-get command :name) key))
+     ((not (listp template))
+      (user-error "Majjic custom command %s must be a list for %s"
+                  (plist-get command :name) key))
+     (t
+      (majjic--expand-custom-command-template template commit-ids)))))
+
+(defun majjic--expand-custom-command-template (template commit-ids)
+  "Expand custom command TEMPLATE using COMMIT-IDS."
+  (apply #'append
+         (mapcar (lambda (part)
+                   (majjic--expand-custom-command-part part commit-ids))
+                 template)))
+
+(defun majjic--expand-custom-command-part (part commit-ids)
+  "Expand one custom command template PART using COMMIT-IDS."
+  (cond
+   ((stringp part)
+    (list part))
+   ((eq part :revset)
+    (list (mapconcat #'identity commit-ids " | ")))
+   ((and (consp part) (eq (car part) :revisions))
+    (let ((prefix (cadr part)))
+      (unless (and (stringp prefix) (= (length part) 2))
+        (user-error "Invalid :revisions placeholder: %S" part))
+      (cl-mapcan (lambda (commit-id)
+                   (list prefix commit-id))
+                 commit-ids)))
+   (t
+    (user-error "Invalid custom command template part: %S" part))))
+
+(defun majjic--run-custom-command-with-preview (command command-args preview-args confirm)
+  "Preview COMMAND with PREVIEW-ARGS before running COMMAND-ARGS."
+  (let ((name (plist-get command :name)))
+    (majjic--status-message "Preparing %s preview..." name)
+    (setq majjic--preview-in-progress t)
+    (majjic--set-operation-status "Previewing")
+    (condition-case err
+        (let (preview-finished
+              process)
+          (setq process
+                (majjic--custom-command-preview-result-async
+                 preview-args
+                 (lambda (exit-code preview)
+                   (setq preview-finished t)
+                   (setq majjic--preview-in-progress nil)
+                   (setq majjic--preview-process nil)
+                   (majjic--set-operation-status nil)
+                   (if (zerop exit-code)
+                       (when (or (null confirm)
+                                 (majjic--confirm-preview name preview confirm))
+                         (majjic--start-custom-command command command-args))
+                     (majjic--show-preview name preview
+                                           (format "%s preview failed; press any key to close" name))
+                     (message "%s preview failed" name)))))
+          (unless preview-finished
+            (setq majjic--preview-process process)))
+      (error
+       (setq majjic--preview-in-progress nil)
+       (setq majjic--preview-process nil)
+       (majjic--set-operation-status nil)
+       (signal (car err) (cdr err))))))
+
+(defun majjic--custom-command-preview-result-async (args callback)
+  "Run custom preview ARGS and invoke CALLBACK with (EXIT-CODE OUTPUT)."
+  (apply #'majjic--call-jj-capture-async majjic--repo-root
+         (lambda (exit-code stdout stderr)
+           (funcall callback
+                    exit-code
+                    (string-trim-right
+                     (if (string-blank-p stdout) stderr stdout))))
+         args))
+
+(defun majjic--start-custom-command (command args)
+  "Run custom COMMAND with expanded ARGS."
+  (when-let* ((status (plist-get command :status)))
+    (majjic--status-message "%s" status))
+  (majjic--run-mutation
+   (lambda () args)
+   :refresh (if (plist-member command :refresh)
+                (plist-get command :refresh)
+              t)))
+
 (defun majjic-git-fetch (&optional tracked)
   "Fetch from the configured Git remote and refresh.
 When TRACKED is non-nil, fetch only tracked bookmarks."
@@ -640,6 +808,13 @@ When already in rebase mode, switch the source back to a single revision."
              :target-mode 'onto))
       (majjic-rebase-mode 1)
       (message "Rebase mode: r revision, s descendants, o onto, a after, b before, RET apply, C-g cancel"))))
+
+(defun majjic-squash-or-rebase-source-descendants ()
+  "Enter squash mode, or select descendants while staging a rebase."
+  (interactive)
+  (if majjic-rebase-mode
+      (majjic-rebase-set-source-descendants)
+    (majjic-squash-start)))
 
 (defun majjic-squash-start ()
   "Enter squash mode using marked revisions, or the current revision, as source."

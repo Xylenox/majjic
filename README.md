@@ -20,7 +20,7 @@ https://github.com/user-attachments/assets/9da48e9c-72da-463d-91a3-b97fefcf597d
 - `SPC` toggle a persistent mark on the current revision and move to the next revision
 - `M` clear all marks
 - `a` abandon the currently marked revisions after confirmation
-- `r` enter rebase mode using marked revisions as the source, or the current revision if none are marked; in rebase mode, `o` / `a` / `b` choose onto / after / before, `RET` applies, and `C-g` cancels
+- `r` enter rebase mode using marked revisions as the source, or the current revision if none are marked; in rebase mode, `s` selects source descendants, `o` / `a` / `b` choose onto / after / before, `RET` applies, and `C-g` cancels
 - `s` enter squash mode using marked revisions as the source, or the current revision if none are marked; Majjic selects the common parent as the initial destination when available, `RET` applies, and `C-g` cancels
 - `u` undo the latest operation after confirming a full op-log peek
 - `U` redo the latest undone operation after confirming a full op-log peek
@@ -28,7 +28,28 @@ https://github.com/user-attachments/assets/9da48e9c-72da-463d-91a3-b97fefcf597d
 - `G f t` fetch only tracked bookmarks from the configured Git remote and refresh
 - `G p c` push the marked visible revisions, or the current revision if none are marked, by `jj git push --change` after a dry-run confirmation
 - `G p p` push bookmarks pointing at the marked visible revisions, or the current revision if none are marked, by `jj git push --revision` after a dry-run confirmation
+- `:` run a configured Majjic custom command by name
 - Mutations and `g` refresh run asynchronously; while one is in flight, navigation, snapshots, and lazy diff expansion stay available, but marks, rebase edits, and refresh are blocked
 - `O` reserved for an op-log browser
 - `B` reserved for a bookmark browser
 - `g` refresh
+
+## Custom Commands
+
+Majjic custom commands are selected from the `:` prompt.  They run through
+`majjic-program`, so Jujutsu aliases work naturally.  For example, to run a
+user-configured `jj gt-submit` alias against the marked visible revisions, or
+the current revision when nothing is marked:
+
+```elisp
+(setq majjic-custom-commands
+      '((:name "Graphite submit"
+         :command ("gt-submit" "-r" :revset)
+         :preview ("gt-submit" "--dry-run" "-r" :revset)
+         :confirm "Submit selected revision with Graphite? "
+         :status "Submitting selected revision..."
+         :refresh t)))
+```
+
+Command templates support `:revset` for one selected-revisions revset argument
+and `(:revisions PREFIX)` for repeated revision arguments.
