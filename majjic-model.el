@@ -25,7 +25,8 @@
   expanded-commit-ids
   expanded-file-keys
   marked-change-ids
-  rebase-state)
+  rebase-state
+  squash-state)
 
 (cl-defstruct majjic-rebase-state
   "Transient state for `majjic-rebase-mode'."
@@ -33,6 +34,10 @@
   source-mode
   moved-change-ids
   target-mode)
+
+(cl-defstruct majjic-squash-state
+  "Transient state for `majjic-squash-mode'."
+  source-change-ids)
 
 (cl-defstruct majjic-revision
   "Parsed revision row from `jj log'."

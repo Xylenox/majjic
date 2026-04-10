@@ -285,6 +285,15 @@ Keyword args:
   "Return `jj describe' arguments for COMMIT-ID and MESSAGE."
   (list "describe" "-r" commit-id "-m" message))
 
+(defun majjic--squash-args (sources destination)
+  "Return `jj squash' arguments for SOURCES into DESTINATION.
+SOURCES may be a single revision id or a list of revision ids."
+  (append
+   (list "squash")
+   (cl-mapcan (lambda (source) (list "--from" source))
+              (if (listp sources) sources (list sources)))
+   (list "--into" destination "--use-destination-message")))
+
 (defun majjic--revision-description (commit-id)
   "Return the description for COMMIT-ID in the current repository view."
   (majjic--call-jj majjic--repo-root "log" "-r" commit-id

@@ -21,6 +21,7 @@ https://github.com/user-attachments/assets/9da48e9c-72da-463d-91a3-b97fefcf597d
 - `M` clear all marks
 - `a` abandon the currently marked revisions after confirmation
 - `r` enter rebase mode using marked revisions as the source, or the current revision if none are marked; in rebase mode, `o` / `a` / `b` choose onto / after / before, `RET` applies, and `C-g` cancels
+- `s` enter squash mode using marked revisions as the source, or the current revision if none are marked; Majjic selects the common parent as the initial destination when available, `RET` applies, and `C-g` cancels
 - `u` undo the latest operation after confirming a full op-log peek
 - `U` redo the latest undone operation after confirming a full op-log peek
 - `G f f` fetch from the configured Git remote and refresh

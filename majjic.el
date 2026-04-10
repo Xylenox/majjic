@@ -20,6 +20,7 @@
 (require 'ansi-color)
 (require 'cl-lib)
 (require 'magit-section)
+(require 'seq)
 (require 'subr-x)
 (require 'majjic-model)
 
@@ -107,6 +108,12 @@ When nil, render every row from `jj diff --summary'."
 (defvar-local majjic--rebase-overlays nil
   "Overlays used to preview rebase source and target in `majjic-rebase-mode'.")
 
+(defvar-local majjic--squash-state nil
+  "Transient state for `majjic-squash-mode'.")
+
+(defvar-local majjic--squash-overlays nil
+  "Overlays used to preview squash source and destination.")
+
 (defconst majjic--op-preview-max-height 10
   "Maximum height for the temporary undo/redo operation preview window.")
 
@@ -135,7 +142,11 @@ When nil, render every row from `jj diff --summary'."
 (declare-function majjic--revision-description "majjic-jj")
 (declare-function majjic--reset-section-load "majjic-render")
 (declare-function majjic--section-load-process-live-p "majjic-render")
+(declare-function majjic--single-parent-commit-id "majjic-jj")
 (declare-function majjic--sync-rebase-overlays "majjic-render")
+(declare-function majjic--clear-squash-overlays "majjic-render")
+(declare-function majjic--squash-args "majjic-jj")
+(declare-function majjic--sync-squash-overlays "majjic-render")
 (declare-function majjic--undo-args "majjic-jj")
 (declare-function magit-section-update-highlight "magit-section" (&optional force))
 
@@ -221,6 +232,7 @@ When nil, render every row from `jj diff --summary'."
   "B" #'majjic-bookmark-browser
   "a" #'majjic-abandon-start
   "r" #'majjic-rebase-start
+  "s" #'majjic-squash-start
   "u" #'majjic-undo
   "U" #'majjic-redo
   "G" majjic-git-map
@@ -241,6 +253,12 @@ When nil, render every row from `jj diff --summary'."
   "RET" #'majjic-rebase-apply
   "<return>" #'majjic-rebase-apply
   "C-g" #'majjic-rebase-cancel)
+
+(defvar-keymap majjic-squash-mode-map
+  "RET" #'majjic-squash-apply
+  "<return>" #'majjic-squash-apply
+  "C-g" #'majjic-squash-cancel
+  "s" #'majjic-squash-disabled-command)
 
 (defvar-keymap majjic-revision-section-map
   :parent majjic-section-map)
@@ -265,7 +283,8 @@ When nil, render every row from `jj diff --summary'."
   (setq-local truncate-lines t)
   (add-hook 'post-command-hook #'majjic--update-selected-hunk-heading nil t)
   (add-hook 'post-command-hook #'majjic--sync-mark-overlays nil t)
-  (add-hook 'post-command-hook #'majjic--sync-rebase-overlays nil t))
+  (add-hook 'post-command-hook #'majjic--sync-rebase-overlays nil t)
+  (add-hook 'post-command-hook #'majjic--sync-squash-overlays nil t))
 
 (defvar-keymap majjic-snapshot-mode-map
   :parent special-mode-map
@@ -289,6 +308,19 @@ When nil, render every row from `jj diff --summary'."
   (majjic--sync-rebase-overlays)
   (force-mode-line-update))
 
+(define-minor-mode majjic-squash-mode
+  "Minor mode for staging a `jj squash' interactively in a `majjic' log buffer."
+  :lighter " Squash"
+  :keymap majjic-squash-mode-map
+  (unless (derived-mode-p 'majjic-log-mode)
+    (setq majjic-squash-mode nil)
+    (user-error "Not in a majjic log buffer"))
+  (unless majjic-squash-mode
+    (setq majjic--squash-state nil)
+    (majjic--clear-squash-overlays))
+  (majjic--sync-squash-overlays)
+  (force-mode-line-update))
+
 (keymap-set majjic-log-mode-map "n" #'majjic-section-forward)
 (keymap-set majjic-log-mode-map "p" #'majjic-section-backward)
 (keymap-set majjic-log-mode-map "^" #'majjic-section-up)
@@ -300,6 +332,7 @@ When nil, render every row from `jj diff --summary'."
 (keymap-set majjic-log-mode-map "B" #'majjic-bookmark-browser)
 (keymap-set majjic-log-mode-map "a" #'majjic-abandon-start)
 (keymap-set majjic-log-mode-map "r" #'majjic-rebase-start)
+(keymap-set majjic-log-mode-map "s" #'majjic-squash-start)
 (keymap-set majjic-log-mode-map "u" #'majjic-undo)
 (keymap-set majjic-log-mode-map "U" #'majjic-redo)
 (keymap-set majjic-log-mode-map "G" majjic-git-map)
@@ -359,6 +392,8 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
     (user-error "Not in a majjic log buffer"))
   (when majjic--mutation-in-progress
     (user-error "Operation in progress"))
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (majjic--log-refresh-async (majjic--capture-refresh-state)))
 
 (defun majjic-new ()
@@ -367,6 +402,8 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
   (majjic--require-no-operation-in-progress)
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (let ((parent-ids (or (majjic--marked-visible-commit-ids)
                         (list (majjic--require-current-commit-id)))))
     (majjic--run-mutation
@@ -380,6 +417,8 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
   (majjic--require-no-operation-in-progress)
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (let ((commit-id (majjic--require-current-commit-id)))
     (majjic--run-mutation
      (lambda ()
@@ -392,6 +431,8 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
   (majjic--require-no-operation-in-progress)
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (let* ((commit-id (majjic--require-current-commit-id))
          (change-id (majjic--change-id-for-commit-id commit-id))
          (description (majjic--revision-description commit-id))
@@ -410,6 +451,8 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
   (majjic--require-no-operation-in-progress)
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (majjic--run-confirmed-op-mutation
    "undo"
    (lambda ()
@@ -421,6 +464,8 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
   (majjic--require-no-operation-in-progress)
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (majjic--run-confirmed-op-mutation
    "redo"
    (lambda ()
@@ -455,6 +500,8 @@ When TRACKED is non-nil, fetch only tracked bookmarks."
   (majjic--require-no-operation-in-progress)
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (majjic--status-message
    (if tracked
        "Fetching tracked bookmarks from Git remote..."
@@ -475,6 +522,8 @@ shown while the confirmed push runs."
   (majjic--require-no-operation-in-progress)
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (let ((commit-ids (or (majjic--marked-visible-commit-ids)
                         (list (majjic--require-current-commit-id)))))
     (majjic--status-message "Preparing Git push dry-run...")
@@ -532,6 +581,8 @@ Temporarily apply strike-through rendering while the confirmation prompt is
 open.  If rebase mode is active, keep using `a' for rebase-after instead."
   (interactive)
   (majjic--require-no-operation-in-progress)
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (if majjic-rebase-mode
       (majjic-rebase-set-after)
     (let* ((selected-ids (majjic--marked-visible-commit-ids))
@@ -564,6 +615,8 @@ open.  If rebase mode is active, keep using `a' for rebase-after instead."
 When already in rebase mode, switch the source back to a single revision."
   (interactive)
   (majjic--require-no-operation-in-progress)
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (if majjic-rebase-mode
       (majjic-rebase-set-source-revision)
     (let* ((visible-marked (majjic--marked-visible-change-ids))
@@ -583,10 +636,49 @@ When already in rebase mode, switch the source back to a single revision."
       (majjic-rebase-mode 1)
       (message "Rebase mode: r revision, s descendants, o onto, a after, b before, RET apply, C-g cancel"))))
 
+(defun majjic-squash-start ()
+  "Enter squash mode using marked revisions, or the current revision, as source."
+  (interactive)
+  (majjic--require-no-operation-in-progress)
+  (when majjic-rebase-mode
+    (majjic-rebase-disabled-command))
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
+  (let* ((visible-marked (majjic--marked-visible-change-ids))
+         (source-change-ids
+          (or visible-marked
+              (list (majjic--change-id-for-commit-id
+                     (majjic--require-current-commit-id))))))
+    (setq majjic--squash-state
+          (make-majjic-squash-state
+           :source-change-ids source-change-ids))
+    (majjic-squash-mode 1)
+    (when-let* ((destination (majjic--squash-default-destination-commit-id
+                              source-change-ids)))
+      (majjic--goto-commit destination)
+      (majjic--sync-squash-overlays))
+    (message "Squash mode: parent selected when available, RET apply, C-g cancel")))
+
+(defun majjic--squash-default-destination-commit-id (source-change-ids)
+  "Return the common unique parent commit id for SOURCE-CHANGE-IDS, or nil."
+  (let ((parents
+         (delq nil
+               (mapcar
+                (lambda (change-id)
+                  (when-let* ((commit-id (majjic--commit-id-for-change-id change-id)))
+                    (majjic--single-parent-commit-id commit-id)))
+                source-change-ids))))
+    (when (and (= (length parents) (length source-change-ids))
+               (let ((first (car parents)))
+                 (seq-every-p (lambda (parent) (equal parent first)) parents)))
+      (car parents))))
+
 (defun majjic-toggle-mark ()
   "Toggle a persistent mark on the current revision."
   (interactive)
   (majjic--require-no-operation-in-progress)
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (let* ((revision (or (majjic--current-revision-section)
                        (user-error "No revision selected")))
          (change-id (oref revision change-id)))
@@ -605,6 +697,8 @@ When already in rebase mode, switch the source back to a single revision."
   "Clear all persistent marks in the current log buffer."
   (interactive)
   (majjic--require-no-operation-in-progress)
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (setq majjic--marked-change-ids nil)
   (majjic--clear-mark-overlays)
   (majjic--refresh-rebase-source-from-marks)
@@ -626,36 +720,48 @@ This keybinding is reserved; the browser itself is not implemented yet."
   "Set the rebase target placement to onto."
   (interactive)
   (majjic--require-no-operation-in-progress)
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (majjic--rebase-set-target-mode 'onto))
 
 (defun majjic-rebase-set-after ()
   "Set the rebase target placement to after."
   (interactive)
   (majjic--require-no-operation-in-progress)
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (majjic--rebase-set-target-mode 'after))
 
 (defun majjic-rebase-set-before ()
   "Set the rebase target placement to before."
   (interactive)
   (majjic--require-no-operation-in-progress)
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (majjic--rebase-set-target-mode 'before))
 
 (defun majjic-rebase-set-source-revision ()
   "Set the rebase source to the selected revision only."
   (interactive)
   (majjic--require-no-operation-in-progress)
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (majjic--rebase-set-source-mode 'revision))
 
 (defun majjic-rebase-set-source-descendants ()
   "Set the rebase source to the selected revision and its descendants."
   (interactive)
   (majjic--require-no-operation-in-progress)
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (majjic--rebase-set-source-mode 'descendants))
 
 (defun majjic-rebase-apply ()
   "Apply the staged rebase."
   (interactive)
   (majjic--require-no-operation-in-progress)
+  (when majjic-squash-mode
+    (majjic-squash-disabled-command))
   (unless majjic-rebase-mode
     (user-error "Not in rebase mode"))
   (let* ((source (majjic-rebase-state-source-change-id majjic--rebase-state))
@@ -689,6 +795,43 @@ This keybinding is reserved; the browser itself is not implemented yet."
   "Reject commands that are unavailable while staging a rebase."
   (interactive)
   (user-error "Disabled in rebase mode"))
+
+(defun majjic-squash-apply ()
+  "Apply the staged squash into the current revision."
+  (interactive)
+  (majjic--require-no-operation-in-progress)
+  (unless majjic-squash-mode
+    (user-error "Not in squash mode"))
+  (let* ((sources (majjic-squash-state-source-change-ids majjic--squash-state))
+         (destination (majjic--require-current-commit-id))
+         (destination-change-id (majjic--change-id-for-commit-id destination)))
+    (when (member destination-change-id sources)
+      (user-error "Squash destination is inside source revisions"))
+    (majjic--run-mutation
+     (lambda ()
+       (majjic--squash-args sources destination))
+     :after-success (lambda ()
+                      (majjic-squash-mode -1))
+     :target (lambda ()
+               (let ((fallbacks (majjic--selection-fallbacks destination)))
+                 (or (majjic--commit-id-for-change-id destination-change-id)
+                     (and (majjic--revision-exists-p destination) destination)
+                     (seq-find #'majjic--revision-exists-p fallbacks)
+                     (majjic--working-copy-commit-id)))))))
+
+(defun majjic-squash-cancel ()
+  "Cancel squash mode without mutating the repository."
+  (interactive)
+  (majjic--require-no-operation-in-progress)
+  (unless majjic-squash-mode
+    (user-error "Not in squash mode"))
+  (majjic-squash-mode -1)
+  (message "Squash canceled"))
+
+(defun majjic-squash-disabled-command ()
+  "Reject commands that are unavailable while staging a squash."
+  (interactive)
+  (user-error "Disabled in squash mode"))
 
 (defun majjic--run-confirmed-op-mutation (action thunk)
   "Preview the latest operation, confirm ACTION, and run mutating THUNK."
@@ -970,7 +1113,8 @@ Follow Magit's naming style with a repo-specific buffer when possible."
      :expanded-commit-ids (majjic--expanded-commit-ids)
      :expanded-file-keys (majjic--expanded-file-keys)
      :marked-change-ids majjic--marked-change-ids
-     :rebase-state majjic--rebase-state)))
+     :rebase-state majjic--rebase-state
+     :squash-state majjic--squash-state)))
 
 (defun majjic--log-refresh-async (state &optional generation)
   "Asynchronously refresh the current buffer, preserving UI STATE.
@@ -1080,6 +1224,7 @@ operation and ignore stale callbacks from older generations."
   (setq majjic--marked-change-ids (majjic-state-marked-change-ids state))
   (setq majjic--abandon-selected-commit-ids nil)
   (setq majjic--rebase-state (majjic-state-rebase-state state))
+  (setq majjic--squash-state (majjic-state-squash-state state))
   (when majjic--rebase-state
     (setf (majjic-rebase-state-moved-change-ids majjic--rebase-state)
           (majjic--rebase-moved-change-ids
@@ -1097,6 +1242,7 @@ operation and ignore stale callbacks from older generations."
             (magit-section-goto (magit-section-at))))
         (majjic--sync-mark-overlays)
         (majjic--sync-rebase-overlays)
+        (majjic--sync-squash-overlays)
         (majjic--refresh-selection-highlights))
     (majjic--insert-message "No revisions to show.")))
 

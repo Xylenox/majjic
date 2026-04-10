@@ -399,6 +399,233 @@
       (let ((majjic-rebase-mode t))
         (should-error (majjic-describe) :type 'user-error)))))
 
+(ert-deftest majjic-test-squash-command-args-bindings-and-source-selection ()
+  "Squash helpers should build args and mode should seed sources predictably."
+  (should (equal (majjic--squash-args "one" "dest")
+                 '("squash" "--from" "one" "--into" "dest" "--use-destination-message")))
+  (should (equal (majjic--squash-args '("one" "two") "dest")
+                 '("squash" "--from" "one" "--from" "two"
+                   "--into" "dest" "--use-destination-message")))
+  (with-temp-buffer
+    (majjic-log-mode)
+    (should (eq (key-binding (kbd "s")) #'majjic-squash-start))
+    (let ((majjic--repo-root "/tmp/majjic-test"))
+      (let ((inhibit-read-only t))
+        (majjic--render-records
+         (list (make-majjic-revision
+                :kind 'revision
+                :change-id "change-1"
+                :commit-id "commit-1"
+                :heading "◆ commit-1 one"
+                :summary "one")
+               (make-majjic-revision
+                :kind 'revision
+                :change-id "change-2"
+                :commit-id "commit-2"
+                :heading "◆ commit-2 two"
+                :summary "two")
+               (make-majjic-revision
+                :kind 'revision
+                :change-id "parent-change"
+                :commit-id "parent-commit"
+                :heading "◆ parent-commit parent"
+                :summary "parent"))
+         (make-majjic-state)))
+      (cl-letf (((symbol-function 'majjic--change-id-for-commit-id)
+                 (lambda (commit-id)
+                   (should (equal commit-id "commit-1"))
+                   "change-1"))
+                ((symbol-function 'majjic--commit-id-for-change-id)
+                 (lambda (change-id)
+                   (pcase change-id
+                     ("change-1" "commit-1")
+                     (_ nil))))
+                ((symbol-function 'majjic--single-parent-commit-id)
+                 (lambda (commit-id)
+                   (should (equal commit-id "commit-1"))
+                   "parent-commit")))
+        (majjic-squash-start)
+        (should majjic-squash-mode)
+        (should (equal (majjic-squash-state-source-change-ids majjic--squash-state)
+                       '("change-1")))
+        (should (equal (majjic--current-commit-id) "parent-commit"))
+        (majjic-squash-cancel))
+      (setq majjic--marked-change-ids '("change-2" "change-1"))
+      (majjic--sync-mark-overlays)
+      (majjic--goto-commit "commit-2")
+      (cl-letf (((symbol-function 'majjic--commit-id-for-change-id)
+                 (lambda (change-id)
+                   (pcase change-id
+                     ("change-1" "commit-1")
+                     ("change-2" "commit-2")
+                     (_ nil))))
+                ((symbol-function 'majjic--single-parent-commit-id)
+                 (lambda (commit-id)
+                   (pcase commit-id
+                     ("commit-1" "parent-commit")
+                     ("commit-2" "parent-commit")
+                     (_ nil)))))
+        (majjic-squash-start)
+        (should (equal (majjic-squash-state-source-change-ids majjic--squash-state)
+                       '("change-1" "change-2")))
+        (should (equal (majjic--current-commit-id) "parent-commit"))
+        (should (eq (key-binding (kbd "RET")) #'majjic-squash-apply))
+        (should (eq (key-binding (kbd "C-g")) #'majjic-squash-cancel))
+        (majjic-squash-cancel))
+      (should-not majjic-squash-mode)
+      (should-not majjic--squash-state)
+      (should-not majjic--squash-overlays))))
+
+(ert-deftest majjic-test-squash-start-leaves-point-when-marked-sources-have-different-parents ()
+  "Squash mode should not guess a destination for unrelated source parents."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test"))
+      (let ((inhibit-read-only t))
+        (majjic--render-records
+         (list (make-majjic-revision
+                :kind 'revision
+                :change-id "change-1"
+                :commit-id "commit-1"
+                :heading "◆ commit-1 one"
+                :summary "one")
+               (make-majjic-revision
+                :kind 'revision
+                :change-id "change-2"
+                :commit-id "commit-2"
+                :heading "◆ commit-2 two"
+                :summary "two")
+               (make-majjic-revision
+                :kind 'revision
+                :change-id "parent-a"
+                :commit-id "parent-a-commit"
+                :heading "◆ parent-a-commit parent a"
+                :summary "parent a")
+               (make-majjic-revision
+                :kind 'revision
+                :change-id "parent-b"
+                :commit-id "parent-b-commit"
+                :heading "◆ parent-b-commit parent b"
+                :summary "parent b"))
+         (make-majjic-state :marked-change-ids '("change-1" "change-2"))))
+      (majjic--goto-commit "commit-2")
+      (cl-letf (((symbol-function 'majjic--commit-id-for-change-id)
+                 (lambda (change-id)
+                   (pcase change-id
+                     ("change-1" "commit-1")
+                     ("change-2" "commit-2")
+                     (_ nil))))
+                ((symbol-function 'majjic--single-parent-commit-id)
+                 (lambda (commit-id)
+                   (pcase commit-id
+                     ("commit-1" "parent-a-commit")
+                     ("commit-2" "parent-b-commit")
+                     (_ nil)))))
+        (majjic-squash-start)
+        (should (equal (majjic--current-commit-id) "commit-2"))
+        (majjic-squash-cancel)))))
+
+(ert-deftest majjic-test-squash-mode-preview-and-apply-routing ()
+  "Squash mode should preview sources and route apply through mutation."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          target-spec
+          after-success
+          ran)
+      (let ((inhibit-read-only t))
+        (majjic--render-records
+         (list (make-majjic-revision
+                :kind 'revision
+                :change-id "source-1"
+                :commit-id "commit-1"
+                :heading "◆ commit-1 source one"
+                :summary "source one")
+               (make-majjic-revision
+                :kind 'revision
+                :change-id "source-2"
+                :commit-id "commit-2"
+                :heading "◆ commit-2 source two"
+                :summary "source two")
+               (make-majjic-revision
+                :kind 'revision
+                :change-id "dest"
+                :commit-id "commit-3"
+                :heading "◆ commit-3 destination"
+                :summary "destination"))
+         (make-majjic-state :marked-change-ids '("source-1" "source-2"))))
+      (majjic-squash-start)
+      (should (seq-some (lambda (overlay)
+                          (let ((text (overlay-get overlay 'before-string)))
+                            (and (stringp text)
+                                 (string-match-p "<< squash >>" text))))
+                        majjic--squash-overlays))
+      (majjic--goto-commit "commit-3")
+      (majjic--sync-squash-overlays)
+      (should (seq-some (lambda (overlay)
+                          (let ((text (overlay-get overlay 'before-string)))
+                            (and (stringp text)
+                                 (string-match-p "<< into >>" text)
+                                 (string-match-p "squash 2 revisions" text)
+                                 (string-match-p "dest" text))))
+                        majjic--squash-overlays))
+      (cl-letf (((symbol-function 'majjic--change-id-for-commit-id)
+                 (lambda (commit-id)
+                   (pcase commit-id
+                     ("commit-1" "source-1")
+                     ("commit-2" "source-2")
+                     ("commit-3" "dest"))))
+                ((symbol-function 'majjic--selection-fallbacks)
+                 (lambda (_commit-id)
+                   nil))
+                ((symbol-function 'majjic--commit-id-for-change-id)
+                 (lambda (change-id)
+                   (should (equal change-id "dest"))
+                   "rewritten-dest"))
+                ((symbol-function 'majjic--run-mutation)
+                 (lambda (command &rest plist)
+                   (setq ran (funcall command))
+                   (setq target-spec (plist-get plist :target))
+                   (setq after-success (plist-get plist :after-success)))))
+        (majjic-squash-apply)
+        (should (equal ran '("squash" "--from" "source-1" "--from" "source-2"
+                             "--into" "commit-3" "--use-destination-message")))
+        (funcall after-success)
+        (should-not majjic-squash-mode)
+        (should (equal (funcall target-spec) "rewritten-dest"))))))
+
+(ert-deftest majjic-test-squash-rejects-unavailable-states ()
+  "Squash should use normal guards and reject invalid destinations."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test"))
+      (let ((inhibit-read-only t))
+        (majjic--render-records
+         (list (make-majjic-revision
+                :kind 'revision
+                :change-id "source"
+                :commit-id "commit-1"
+                :heading "◆ commit-1 source"
+                :summary "source"))
+         (make-majjic-state)))
+      (let ((majjic--mutation-in-progress t))
+        (should-error (majjic-squash-start) :type 'user-error))
+      (let ((majjic-rebase-mode t))
+        (should-error (majjic-squash-start) :type 'user-error))
+      (setq majjic--squash-state
+            (make-majjic-squash-state :source-change-ids '("source")))
+      (majjic-squash-mode 1)
+      (cl-letf (((symbol-function 'majjic--change-id-for-commit-id)
+                 (lambda (_commit-id) "source"))
+                ((symbol-function 'majjic--run-mutation)
+                 (lambda (&rest _args)
+                   (error "should not mutate"))))
+        (should-error (majjic-squash-apply) :type 'user-error))
+      (should majjic-squash-mode)
+      (should-error (majjic-toggle-mark) :type 'user-error)
+      (should-error (majjic-rebase-start) :type 'user-error)
+      (majjic-squash-cancel))))
+
 (ert-deftest majjic-test-git-remote-command-args-and-bindings ()
   "Git remote helpers should build expected args and live under a `G' prefix."
   (should (equal (majjic--git-fetch-args)
@@ -1498,6 +1725,67 @@
               (should (equal (jj "log" "-r" (format "parents(%s)" (majjic--current-commit-id))
                                  "--no-graph" "--color" "never" "--template" "commit_id")
                              side)))))))))
+
+(ert-deftest majjic-test-squash-marked-sources-into-destination ()
+  "Applying squash should move marked source changes into the selected destination."
+  (skip-unless (executable-find "jj"))
+  (let* ((repo (make-temp-file "majjic-squash-" t))
+         (default-directory repo))
+    (cl-labels ((jj (&rest args)
+                    (let ((default-directory repo))
+                      (with-temp-buffer
+                        (let ((exit (apply #'process-file "jj" nil t nil args)))
+                          (unless (zerop exit)
+                            (error "jj %S failed: %s" args (buffer-string)))
+                          (string-trim (buffer-string)))))))
+      (jj "git" "init" ".")
+      (let ((root (jj "log" "-r" "@"
+                      "--no-graph" "--color" "never" "--template" "commit_id")))
+        (jj "new" root)
+        (majjic-test--write-repo-file repo "a.txt" "a\n")
+        (jj "describe" "-m" "source one")
+        (let ((source-one (jj "log" "-r" "@"
+                              "--no-graph" "--color" "never" "--template" "commit_id"))
+              (source-one-change (jj "log" "-r" "@"
+                                     "--no-graph" "--color" "never" "--template" "change_id")))
+          (jj "new" root)
+          (majjic-test--write-repo-file repo "b.txt" "b\n")
+          (jj "describe" "-m" "source two")
+          (let ((source-two (jj "log" "-r" "@"
+                                "--no-graph" "--color" "never" "--template" "commit_id"))
+                (source-two-change (jj "log" "-r" "@"
+                                       "--no-graph" "--color" "never" "--template" "change_id")))
+            (jj "new" root)
+            (majjic-test--write-repo-file repo "c.txt" "c\n")
+            (jj "describe" "-m" "destination")
+            (let ((destination-change (jj "log" "-r" "@"
+                                          "--no-graph" "--color" "never" "--template" "change_id")))
+              (majjic)
+              (with-current-buffer (majjic--log-buffer-name repo)
+                (majjic--goto-commit source-one)
+                (majjic-toggle-mark)
+                (majjic--goto-commit source-two)
+                (majjic-toggle-mark)
+                (majjic-squash-start)
+                (should (equal (sort (copy-sequence
+                                      (majjic-squash-state-source-change-ids
+                                       majjic--squash-state))
+                                     #'string<)
+                               (sort (list source-one-change source-two-change)
+                                     #'string<)))
+                (should (equal (majjic--current-commit-id) root))
+                (majjic--goto-commit (majjic--commit-id-for-change-id destination-change))
+                (majjic-squash-apply)
+                (majjic-test--wait-for-idle)
+                (should-not majjic-squash-mode)
+                (should-not (majjic--commit-id-for-change-id source-one-change))
+                (should-not (majjic--commit-id-for-change-id source-two-change))
+                (let* ((destination (majjic--commit-id-for-change-id destination-change))
+                       (summary (jj "diff" "--summary" "-r" destination)))
+                  (should (equal (majjic--current-commit-id) destination))
+                  (should (string-match-p "A a\\.txt" summary))
+                  (should (string-match-p "A b\\.txt" summary))
+                  (should (string-match-p "A c\\.txt" summary)))))))))))
 
 (ert-deftest majjic-test-rebase-descendants-apply-and-reject-internal-target ()
   "Descendants source mode should move the subtree and reject targets inside it."

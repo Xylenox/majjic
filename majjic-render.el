@@ -36,9 +36,12 @@
 (defvar majjic--rebase-state)
 (defvar majjic--render-generation)
 (defvar majjic--selected-hunk-heading-overlays)
+(defvar majjic--squash-overlays)
+(defvar majjic--squash-state)
 (defvar majjic-file-summary-limit)
 (defvar majjic-section-loading-delay)
 (defvar majjic-rebase-mode)
+(defvar majjic-squash-mode)
 
 (defun majjic--revision-heading-text (record)
   "Return propertized heading text for revision RECORD."
@@ -547,6 +550,11 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
   (mapc #'delete-overlay majjic--rebase-overlays)
   (setq majjic--rebase-overlays nil))
 
+(defun majjic--clear-squash-overlays ()
+  "Remove all transient squash preview overlays from the current buffer."
+  (mapc #'delete-overlay majjic--squash-overlays)
+  (setq majjic--squash-overlays nil))
+
 (defun majjic--sync-rebase-overlays ()
   "Rebuild rebase preview overlays for the current point and mode state."
   (majjic--clear-rebase-overlays)
@@ -591,6 +599,64 @@ Restore expanded file diffs listed in EXPANDED-FILE-KEYS."
       (overlay-put overlay 'priority 1003)
       (overlay-put overlay 'evaporate t)
       (push overlay majjic--rebase-overlays))))
+
+(defun majjic--sync-squash-overlays ()
+  "Rebuild squash preview overlays for the current point and mode state."
+  (majjic--clear-squash-overlays)
+  (when (and majjic-squash-mode
+             majjic--squash-state
+             (bound-and-true-p magit-root-section))
+    (let ((sources (majjic-squash-state-source-change-ids majjic--squash-state)))
+      (dolist (revision (oref magit-root-section children))
+        (when (and (object-of-class-p revision 'majjic-revision-section)
+                   (member (oref revision change-id) sources))
+          (majjic--add-squash-source-overlay revision)))
+      (when-let* ((destination (majjic--current-revision-section)))
+        (majjic--add-squash-destination-overlay
+         destination sources (oref destination change-id))))))
+
+(defun majjic--add-squash-source-overlay (section)
+  "Add the squash source marker overlay to SECTION."
+  (when (markerp (oref section start))
+    (let ((overlay (majjic--make-rebase-anchor-overlay
+                    (majjic--revision-marker-position section)))
+          (selected (eq section (majjic--current-revision-section))))
+      (overlay-put overlay 'before-string
+                   (propertize "<< squash >> "
+                               'face (if selected
+                                         '(:inherit (shadow magit-section-highlight)
+                                           :weight bold)
+                                       '(:inherit shadow :weight bold))))
+      (overlay-put overlay 'priority 1003)
+      (overlay-put overlay 'evaporate t)
+      (push overlay majjic--squash-overlays))))
+
+(defun majjic--add-squash-destination-overlay (section sources destination)
+  "Add a destination summary overlay to SECTION for SOURCES into DESTINATION."
+  (when (and sources destination (markerp (oref section start)))
+    (let* ((count (length sources))
+           (prefix (majjic--rebase-target-summary-prefix section 'onto))
+           (source-text (if (= count 1)
+                            (concat "squash revision "
+                                    (propertize (majjic--short-id (car sources))
+                                                'face 'font-lock-keyword-face))
+                          (format "squash %d revisions" count)))
+           (summary (concat (propertize "<< into >>"
+                                        'face '(:inherit shadow :weight bold))
+                            " "
+                            (propertize source-text 'face 'shadow)
+                            " "
+                            (propertize "into" 'face 'shadow)
+                            " "
+                            (propertize (majjic--short-id destination)
+                                        'face 'font-lock-keyword-face)
+                            "\n"))
+           (overlay (majjic--make-rebase-anchor-overlay (oref section start))))
+      (overlay-put overlay 'before-string
+                   (concat (propertize prefix 'face 'default) summary))
+      (overlay-put overlay 'priority 1003)
+      (overlay-put overlay 'evaporate t)
+      (push overlay majjic--squash-overlays))))
 
 (defun majjic--add-rebase-target-overlay (section source target source-mode target-mode)
   "Add the target summary overlay to SECTION for SOURCE, TARGET, and TARGET-MODE.

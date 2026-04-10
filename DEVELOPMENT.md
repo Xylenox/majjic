@@ -19,6 +19,7 @@ Minimal Emacs UI for browsing `jj log`.
 - `M` clears all marks.
 - `a` abandons the currently marked revisions after confirmation.
 - `r` enters rebase mode using marked revisions as the source, or the current revision if none are marked; `o` / `a` / `b` choose onto / after / before, `RET` applies, and `C-g` cancels.
+- `s` enters squash mode using marked revisions as the source, or the current revision if none are marked; Majjic selects the common parent as the initial destination when available, `RET` applies, and `C-g` cancels.
 - `u` undoes the latest operation after confirming a full op-log peek.
 - `U` redoes the latest undone operation after confirming a full op-log peek.
 - `G f f` fetches from the configured Git remote and refreshes.
