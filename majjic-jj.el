@@ -47,6 +47,12 @@
 (defconst majjic--redo-op-desc-prefix "redo: restore to operation "
   "Prefix used by `jj redo' operation descriptions.")
 
+(defconst majjic--change-id-revset-template
+  "if(divergent, change_id ++ \"/\" ++ change_offset, change_id)"
+  "Template for a change id that is safe to pass back to jj as a revset.
+Divergent changes need the `/N' change offset suffix to identify one visible
+revision instead of all commits with the same underlying change id.")
+
 (defun majjic--read-log-records ()
   "Return parsed revision records for the current buffer's repository."
   (unless majjic--repo-root
@@ -65,7 +71,8 @@
 
 (defun majjic--combined-template ()
   "Build the Jujutsu template used to render one revision record."
-  (concat "\"" majjic--record-separator "\" ++ change_id ++ \""
+  (concat "\"" majjic--record-separator "\" ++ "
+          majjic--change-id-revset-template " ++ \""
           majjic--record-separator "\" ++ commit_id ++ \""
           majjic--record-separator "\" ++ builtin_log_comfortable"))
 
@@ -243,7 +250,7 @@ Keyword args:
   (string-trim
    (majjic--call-jj majjic--repo-root "log" "-r" commit-id
                    "--ignore-working-copy" "--no-graph"
-                   "--color" "never" "--template" "change_id")))
+                   "--color" "never" "--template" majjic--change-id-revset-template)))
 
 (defun majjic--commit-id-for-change-id (change-id)
   "Return the current commit id for CHANGE-ID, or nil if it no longer exists."
@@ -478,11 +485,13 @@ LIMIT defaults to 1."
                           (seq-remove #'string-empty-p
                                       (split-string
                                        (string-trim
-                                        (majjic--call-jj majjic--repo-root "log"
-                                                         "-r" (format "(%s)::" source)
-                                                         "--no-graph" "--color" "never"
-                                                         "--template" "change_id ++ \"\\n\""
-                                                         "--ignore-working-copy" "--no-pager"))
+                                       (majjic--call-jj majjic--repo-root "log"
+                                                        "-r" (format "(%s)::" source)
+                                                        "--no-graph" "--color" "never"
+                                                        "--template"
+                                                        (concat majjic--change-id-revset-template
+                                                                " ++ \"\\n\"")
+                                                        "--ignore-working-copy" "--no-pager"))
                                        "\n" t)))
                         sources))
          :test #'equal)
