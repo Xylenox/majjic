@@ -307,13 +307,13 @@ argument pairs."
   (add-hook 'post-command-hook #'majjic--sync-squash-overlays nil t))
 
 (defvar-keymap majjic-snapshot-mode-map
-  :parent special-mode-map
   "q" #'quit-window)
 
-(define-derived-mode majjic-snapshot-mode special-mode "Majjic-Snapshot"
-  "Major mode for read-only `majjic' snapshot buffers.
+(define-minor-mode majjic-snapshot-mode
+  "Minor mode for read-only `majjic' snapshot buffers.
 \\<majjic-snapshot-mode-map>\\[quit-window] closes the temporary snapshot window."
-  :group 'majjic)
+  :group 'majjic
+  :keymap majjic-snapshot-mode-map)
 
 (define-minor-mode majjic-rebase-mode
   "Minor mode for staging a `jj rebase' interactively in a `majjic' log buffer."
@@ -1829,12 +1829,18 @@ read-only snapshot."
                                   "--ignore-working-copy" "-r" commit-id "--" path))
          (short (substring commit-id 0 (min 8 (length commit-id))))
          (buffer (get-buffer-create (format "*majjic %s:%s*" short path)))
+         (worktree-path (expand-file-name path majjic--repo-root))
+         (worktree-dir (file-name-directory worktree-path))
          window)
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
-        (majjic-snapshot-mode)
         (erase-buffer)
         (insert content)
+        (setq default-directory
+              (if (file-exists-p worktree-dir)
+                  worktree-dir
+                majjic--repo-root))
+        (majjic--snapshot-normal-mode worktree-path)
         (goto-char (point-min))
         (majjic--goto-line-column line column)
         (setq-local buffer-read-only t)))
@@ -1848,6 +1854,27 @@ read-only snapshot."
       (with-current-buffer buffer
         (majjic--goto-line-column line column)
         (set-window-point window (point))))))
+
+(defun majjic--snapshot-normal-mode (file)
+  "Select FILE's usual major mode while keeping snapshot-only behavior.
+Snapshot buffers are not actually visiting FILE, but temporarily binding
+`buffer-file-name' lets `normal-mode' choose the same mode it would use for the
+working-tree file."
+  (let ((buffer-file-name file)
+        (after-change-major-mode-hook
+         ;; Snapshot buffers should feel like file buffers without waking up
+         ;; editor integrations that expect a real writable visit.
+         (seq-difference after-change-major-mode-hook
+                         '(global-diff-hl-mode-enable-in-buffer
+                           global-diff-hl-mode-enable-in-buffers
+                           eglot--maybe-activate-editing-mode)
+                         #'eq)))
+    ;; Match Magit's blob buffers: respect nil `enable-local-variables' while
+    ;; still letting file names, shebangs, and file-local variables pick a mode.
+    (normal-mode (not enable-local-variables))
+    (setq buffer-read-only t)
+    (set-buffer-modified-p nil)
+    (majjic-snapshot-mode 1)))
 
 (defun majjic--goto-line-column (&optional line column)
   "Move to LINE and COLUMN in the current buffer when provided."

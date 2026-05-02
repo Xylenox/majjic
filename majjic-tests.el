@@ -1642,6 +1642,17 @@
           (majjic-visit-file))
         (should (equal called '("commit-1" "file.txt")))))))
 
+(ert-deftest majjic-test-snapshot-normal-mode-preserves-file-major-mode ()
+  "Snapshot buffers should use the visited file's ordinary major mode."
+  (with-temp-buffer
+    (insert "(message \"snapshot\")\n")
+    (majjic--snapshot-normal-mode "/tmp/example.el")
+    (should (eq major-mode 'emacs-lisp-mode))
+    (should majjic-snapshot-mode)
+    (should buffer-read-only)
+    (should-not buffer-file-name)
+    (should (eq (key-binding (kbd "q")) #'quit-window))))
+
 (ert-deftest majjic-test-new-uses-marked-revisions-when-present ()
   "`majjic-new' should use visible marked revisions as parents when present."
   (skip-unless (file-directory-p "/Users/andyphan/code/majjic-demo/.jj"))
