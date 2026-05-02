@@ -1730,13 +1730,15 @@ When there are no visible marks, keep the current staged source unchanged."
 (defun majjic--hunk-location (hunk)
   "Return (SIDE LINE COLUMN) for HUNK at point.
 SIDE is `new' for added/context lines and `old' for removed lines.
-When point is on the hunk header, use the first changed line in the body."
+When point is on the hunk header, use the first changed body position on the
+new side; only actual removed body lines visit the old side."
   (save-excursion
-    (when (< (point) (oref hunk content))
-      (goto-char (oref hunk content))
-      (unless (majjic--advance-to-first-changed-hunk-line hunk)
-        (user-error "No changed line in hunk")))
-    (majjic--hunk-location-at-point hunk)))
+    (let ((headerp (< (point) (oref hunk content))))
+      (when headerp
+        (goto-char (oref hunk content))
+        (unless (majjic--advance-to-first-changed-hunk-line hunk)
+          (user-error "No changed line in hunk")))
+      (majjic--hunk-location-at-point hunk (and headerp 'new)))))
 
 (defun majjic--advance-to-first-changed-hunk-line (hunk)
   "Move point to the first added or removed line in HUNK.
@@ -1750,8 +1752,11 @@ Return non-nil if one was found."
           (forward-line 1))))
     found))
 
-(defun majjic--hunk-location-at-point (hunk)
-  "Compute the diff side, line number, and source column for point inside HUNK."
+(defun majjic--hunk-location-at-point (hunk &optional preferred-side)
+  "Compute the diff side, line number, and source column for point inside HUNK.
+When PREFERRED-SIDE is non-nil, return that side's line number even if point is
+currently on the opposite side.  This is used for hunk headers, which should
+open the selected revision rather than inheriting an initial removal line."
   (let ((old (or (oref hunk old-start)
                  (user-error "Cannot parse hunk header")))
         (new (or (oref hunk new-start)
@@ -1774,15 +1779,12 @@ Return non-nil if one was found."
                           new (1+ new)))
           (_ nil))
         (forward-line 1))
-      (pcase (majjic--current-hunk-line-kind hunk)
-        ('old (setq side 'old
-                    line old))
-        ('new (setq side 'new
-                    line new))
-        ('context (setq side 'new
-                        line new))
-        (_ (setq side 'new
-                 line new))))
+      (setq side
+            (or preferred-side
+                (pcase (majjic--current-hunk-line-kind hunk)
+                  ('old 'old)
+                  (_ 'new))))
+      (setq line (if (eq side 'old) old new)))
     (list side line source-column)))
 
 (defun majjic--current-hunk-source-column (hunk)

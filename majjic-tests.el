@@ -1431,6 +1431,48 @@
           (should (equal (oref hunk body-lines) '("-old" "+new")))
           (should-not (oref file load-process)))))))
 
+(ert-deftest majjic-test-hunk-header-visits-selected-revision-even-after-initial-removal ()
+  "Hunk headers should resolve to the new side, not inherit an initial deletion."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          requests
+          visited)
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir callback &rest args)
+                   (push (cons args callback) requests)
+                   (car args))))
+        (let ((inhibit-read-only t))
+          (majjic--render-records
+           (list (make-majjic-revision
+                  :kind 'revision
+                  :change-id "change-1"
+                  :commit-id "commit-1"
+                  :heading "◆ commit-1 test"
+                  :summary "M file.txt"))
+           (make-majjic-state)))
+        (goto-char (point-min))
+        (majjic-toggle-at-point)
+        (funcall (cdar requests) 0 "M file.txt\n" "")
+        (majjic-section-forward)
+        (majjic-toggle-at-point)
+        (funcall (cdar requests) 0 "@@ -1 +1 @@\n-old\n+new\n" "")
+        (let* ((file (majjic--current-file-section))
+               (hunk (car (oref file children))))
+          (magit-section-goto hunk)
+          (should (equal (majjic--hunk-location hunk) '(new 1 0)))
+          (goto-char (oref hunk content))
+          (should (equal (majjic--hunk-location hunk) '(old 1 0)))
+          (magit-section-goto hunk)
+          (cl-letf (((symbol-function 'majjic--visit-file-new-side)
+                     (lambda (commit-id path &optional line column)
+                       (setq visited (list commit-id path line column))))
+                    ((symbol-function 'majjic--single-parent-commit-id)
+                     (lambda (_commit-id)
+                       (ert-fail "hunk headers should not request the parent commit"))))
+            (majjic-visit-file))
+          (should (equal visited '("commit-1" "file.txt" 1 0))))))))
+
 (ert-deftest majjic-test-async-section-load-drops-stale-callbacks ()
   "Section load callbacks from a previous render should be ignored."
   (with-temp-buffer
