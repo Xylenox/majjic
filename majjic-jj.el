@@ -184,13 +184,15 @@ COMMAND is either an argument list or a function returning one.
 Keyword args:
 :target is a commit id or a function returning one after success.
 :after-success is a function called before refreshing after success.
-:refresh, when nil, skips refreshing after success."
+:refresh, when nil, skips refreshing after success.
+:success-message is a string or function returning the completion message."
   (when majjic--mutation-in-progress
     (user-error "Another jj mutation is already running"))
   (unless majjic--repo-root
     (user-error "Not inside a Jujutsu repository"))
   (let* ((target-spec (plist-get plist :target))
          (after-success (plist-get plist :after-success))
+         (success-message-spec (plist-get plist :success-message))
          (refresh (if (plist-member plist :refresh)
                       (plist-get plist :refresh)
                     t))
@@ -208,8 +210,12 @@ Keyword args:
                            (setq majjic--mutation-process nil)
                            (if (zerop exit-code)
                                (condition-case callback-err
-                                   (let* ((current-state (majjic--capture-refresh-state))
-                                          (target (majjic-state-current-commit-id current-state)))
+                                 (let* ((current-state (majjic--capture-refresh-state))
+                                          (target (majjic-state-current-commit-id current-state))
+                                          (success-message
+                                           (if (functionp success-message-spec)
+                                               (funcall success-message-spec)
+                                             success-message-spec)))
                                      (when after-success
                                        (funcall after-success))
                                      (if refresh
@@ -220,8 +226,12 @@ Keyword args:
                                                   (target-spec target-spec)
                                                   (t target)))
                                            (setf (majjic-state-current-commit-id current-state) target)
-                                           (majjic--log-refresh-async current-state generation))
-                                       (majjic--clear-mutation-state)))
+                                           (majjic--log-refresh-async
+                                            current-state generation success-message))
+                                       (progn
+                                         (majjic--clear-mutation-state)
+                                         (when success-message
+                                           (message "%s" success-message)))))
                                  (error
                                   (message "%s" (error-message-string callback-err))
                                   (majjic--clear-mutation-state)))

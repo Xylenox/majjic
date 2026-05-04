@@ -70,6 +70,7 @@ Each entry is a plist with these keys:
 :preview is an optional argv template to run before `:command'.
 :confirm is an optional prompt shown before running `:command'.
 :status is an optional status message shown while `:command' runs.
+:success is an optional completion message shown after success.
 :refresh controls whether Majjic refreshes after success, defaulting to t.
 
 Templates are lists of strings and placeholders.  The `:revset' placeholder
@@ -93,6 +94,9 @@ argument pairs."
 
 (defvar-local majjic--refresh-process nil
   "The current asynchronous refresh process, if any.")
+
+(defvar-local majjic--refresh-completion-message nil
+  "Cons of refresh generation and completion message for the current refresh.")
 
 (defvar-local majjic--preview-in-progress nil
   "Non-nil while an asynchronous preview command is running in this buffer.")
@@ -419,7 +423,7 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
     (user-error "Operation in progress"))
   (when majjic-squash-mode
     (majjic-squash-disabled-command))
-  (majjic--log-refresh-async (majjic--capture-refresh-state)))
+  (majjic--log-refresh-async (majjic--capture-refresh-state) nil "Refreshed"))
 
 (defun majjic-new ()
   "Create a new child of marked revisions, or current revision, and move to `@'."
@@ -434,7 +438,8 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
     (majjic--run-mutation
      (lambda ()
        (cons "new" parent-ids))
-     :target #'majjic--working-copy-commit-id)))
+     :target #'majjic--working-copy-commit-id
+     :success-message "Created new revision")))
 
 (defun majjic-edit ()
   "Edit the current revision and move to `@'."
@@ -448,7 +453,8 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
     (majjic--run-mutation
      (lambda ()
        (list "edit" "-r" commit-id))
-     :target #'majjic--working-copy-commit-id)))
+     :target #'majjic--working-copy-commit-id
+     :success-message "Moved working copy to selected revision")))
 
 (defun majjic-describe ()
   "Describe the current revision using a minibuffer prompt."
@@ -468,7 +474,8 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
        (majjic--describe-args commit-id message))
      :target (lambda ()
                (or (majjic--commit-id-for-change-id change-id)
-                   (majjic--working-copy-commit-id))))))
+                   (majjic--working-copy-commit-id)))
+     :success-message "Updated description")))
 
 (defun majjic-undo ()
   "Undo the latest Jujutsu operation after confirmation."
@@ -480,6 +487,7 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
     (majjic-squash-disabled-command))
   (majjic--run-confirmed-op-mutation
    "undo"
+   "Undid latest change"
    (lambda ()
      (majjic--undo-args))))
 
@@ -493,6 +501,7 @@ If the current directory is not inside a Jujutsu repository, prompt for one."
     (majjic-squash-disabled-command))
   (majjic--run-confirmed-op-mutation
    "redo"
+   "Redid latest change"
    (lambda ()
      (majjic--redo-args))))
 
@@ -664,7 +673,9 @@ When OPTIONAL is non-nil, return nil if KEY is absent."
    (lambda () args)
    :refresh (if (plist-member command :refresh)
                 (plist-get command :refresh)
-              t)))
+              t)
+   :success-message (or (plist-get command :success)
+                        (format "%s finished" (plist-get command :name)))))
 
 (defun majjic-git-fetch (&optional tracked)
   "Fetch from the configured Git remote and refresh.
@@ -681,17 +692,21 @@ When TRACKED is non-nil, fetch only tracked bookmarks."
      "Fetching from Git remote..."))
   (majjic--run-mutation
    (lambda ()
-     (majjic--git-fetch-args tracked))))
+     (majjic--git-fetch-args tracked))
+   :success-message (if tracked
+                        "Fetched tracked bookmarks from Git remote"
+                      "Fetched from Git remote")))
 
 (defun majjic-git-fetch-tracked ()
   "Fetch only tracked bookmarks from the configured Git remote and refresh."
   (interactive)
   (majjic-git-fetch t))
 
-(defun majjic--git-push-selected (args-function confirm-prompt push-status)
+(defun majjic--git-push-selected
+    (args-function confirm-prompt push-status success-message)
   "Push selected revisions after previewing with ARGS-FUNCTION.
 CONFIRM-PROMPT is passed to `majjic--confirm-preview'.  PUSH-STATUS is
-shown while the confirmed push runs."
+shown while the confirmed push runs.  SUCCESS-MESSAGE is shown afterward."
   (majjic--require-no-operation-in-progress)
   (when majjic-rebase-mode
     (majjic-rebase-disabled-command))
@@ -719,7 +734,8 @@ shown while the confirmed push runs."
                          (majjic--status-message push-status)
                          (majjic--run-mutation
                           (lambda ()
-                            (funcall args-function commit-ids))))
+                            (funcall args-function commit-ids))
+                          :success-message success-message))
                      (majjic--show-preview "push" preview "Git push dry-run failed; press any key to close")
                      (message "Git push dry-run failed")))))
           (unless preview-finished
@@ -737,7 +753,8 @@ Ask for confirmation after a dry-run preview."
   (majjic--git-push-selected
    #'majjic--git-push-change-args
    "Push selected changes? "
-   "Pushing selected changes..."))
+   "Pushing selected changes..."
+   "Pushed selected changes"))
 
 (defun majjic-git-push ()
   "Push marked visible revisions, or the current revision, by revision.
@@ -746,7 +763,8 @@ Ask for confirmation after a dry-run preview."
   (majjic--git-push-selected
    #'majjic--git-push-revision-args
    "Push selected revisions? "
-   "Pushing selected revisions..."))
+   "Pushing selected revisions..."
+   "Pushed selected revisions"))
 
 (defun majjic-abandon-start ()
   "Abandon marked visible revisions after confirmation.
@@ -778,7 +796,9 @@ open.  If rebase mode is active, keep using `a' for rebase-after instead."
                          (majjic--prefixed-rev-args selected-ids)))
                :target (lambda ()
                          (or (seq-find #'majjic--revision-exists-p fallbacks)
-                             (majjic--working-copy-commit-id))))))
+                             (majjic--working-copy-commit-id)))
+               :success-message
+               (format "Abandoned %d revision%s" count (if (= count 1) "" "s")))))
         (setq majjic--abandon-selected-commit-ids nil)
         (majjic--clear-abandon-overlays)
         (majjic--sync-mark-overlays)))))
@@ -960,7 +980,9 @@ This keybinding is reserved; the browser itself is not implemented yet."
                       (majjic-rebase-mode -1))
      :target (lambda ()
                (or (majjic--commit-id-for-change-id (car sources))
-                   (majjic--working-copy-commit-id))))))
+                   (majjic--working-copy-commit-id)))
+     :success-message
+     (format "Rebased %d revision%s" (length sources) (if (= (length sources) 1) "" "s")))))
 
 (defun majjic-rebase-cancel ()
   "Cancel rebase mode without mutating the repository."
@@ -997,7 +1019,9 @@ This keybinding is reserved; the browser itself is not implemented yet."
                  (or (majjic--commit-id-for-change-id destination-change-id)
                      (and (majjic--revision-exists-p destination) destination)
                      (seq-find #'majjic--revision-exists-p fallbacks)
-                     (majjic--working-copy-commit-id)))))))
+                     (majjic--working-copy-commit-id))))
+     :success-message
+     (format "Squashed %d revision%s" (length sources) (if (= (length sources) 1) "" "s")))))
 
 (defun majjic-squash-cancel ()
   "Cancel squash mode without mutating the repository."
@@ -1013,8 +1037,9 @@ This keybinding is reserved; the browser itself is not implemented yet."
   (interactive)
   (user-error "Disabled in squash mode"))
 
-(defun majjic--run-confirmed-op-mutation (action thunk)
-  "Preview the latest operation, confirm ACTION, and run mutating THUNK."
+(defun majjic--run-confirmed-op-mutation (action success-message thunk)
+  "Preview the latest operation, confirm ACTION, and run mutating THUNK.
+SUCCESS-MESSAGE is shown after THUNK completes successfully."
   (let* ((current (majjic--current-commit-id))
          (current-change-id (and current (majjic--change-id-for-commit-id current)))
          (fallbacks (majjic--selection-fallbacks current)))
@@ -1026,7 +1051,8 @@ This keybinding is reserved; the browser itself is not implemented yet."
                           (majjic--commit-id-for-change-id current-change-id))
                      (and current (majjic--revision-exists-p current) current)
                      (seq-find #'majjic--revision-exists-p fallbacks)
-                     (majjic--working-copy-commit-id)))))))
+                     (majjic--working-copy-commit-id)))
+       :success-message success-message))))
 
 (defun majjic--confirm-latest-operation (action)
   "Show the effective operation preview in a side window and ask to perform ACTION."
@@ -1334,10 +1360,11 @@ angle brackets."
      :rebase-state majjic--rebase-state
      :squash-state majjic--squash-state)))
 
-(defun majjic--log-refresh-async (state &optional generation)
+(defun majjic--log-refresh-async (state &optional generation completion-message)
   "Asynchronously refresh the current buffer, preserving UI STATE.
 When GENERATION is non-nil, treat the refresh as part of an existing mutation
-operation and ignore stale callbacks from older generations."
+operation and ignore stale callbacks from older generations.
+When COMPLETION-MESSAGE is non-nil, show it after a successful refresh."
   (unless majjic--repo-root
     (user-error "Not inside a Jujutsu repository"))
   (when (and (majjic--operation-process-live-p majjic--refresh-process)
@@ -1347,6 +1374,9 @@ operation and ignore stale callbacks from older generations."
                                 (setq majjic--process-generation
                                       (1+ majjic--process-generation))))
         process)
+    (setq majjic--refresh-completion-message
+          (and completion-message
+               (cons refresh-generation completion-message)))
     (majjic--set-operation-status "Refreshing")
     (setq process
           (apply #'majjic--call-jj-capture-async majjic--repo-root
@@ -1379,7 +1409,7 @@ operation and ignore stale callbacks from older generations."
     (if (zerop exit-code)
         (majjic--start-log-refresh-read state refresh-generation)
       (majjic--render-refresh-error (majjic--jj-error-message stdout stderr))
-      (majjic--finish-refresh refresh-generation))))
+      (majjic--finish-refresh refresh-generation nil))))
 
 (defun majjic--start-log-refresh-read (state refresh-generation)
   "Start the read-only log process for asynchronous refresh."
@@ -1387,19 +1417,22 @@ operation and ignore stale callbacks from older generations."
     (setq process
           (apply #'majjic--call-jj-capture-async majjic--repo-root
                  (lambda (exit-code stdout stderr)
-                   (when (eq process majjic--refresh-process)
-                     (setq majjic--refresh-process nil))
-                   (when (= refresh-generation majjic--process-generation)
-                     (if (zerop exit-code)
-                         (condition-case err
-                             (majjic--render-refreshed-records
-                              (majjic--parse-log-output stdout) state)
-                           (error
-                            (majjic--render-refresh-error
-                             (error-message-string err))))
-                       (majjic--render-refresh-error
-                        (majjic--jj-error-message stdout stderr))))
-                   (majjic--finish-refresh refresh-generation))
+                   (let (refresh-succeeded)
+                     (when (eq process majjic--refresh-process)
+                       (setq majjic--refresh-process nil))
+                     (when (= refresh-generation majjic--process-generation)
+                       (if (zerop exit-code)
+                           (condition-case err
+                               (progn
+                                 (majjic--render-refreshed-records
+                                  (majjic--parse-log-output stdout) state)
+                                 (setq refresh-succeeded t))
+                             (error
+                              (majjic--render-refresh-error
+                               (error-message-string err))))
+                         (majjic--render-refresh-error
+                          (majjic--jj-error-message stdout stderr))))
+                     (majjic--finish-refresh refresh-generation refresh-succeeded)))
                  (majjic--log-args)))
     (setq majjic--refresh-process process)
     process))
@@ -1416,13 +1449,21 @@ operation and ignore stale callbacks from older generations."
     (erase-buffer)
     (majjic--render-error message)))
 
-(defun majjic--finish-refresh (refresh-generation)
-  "Clear async refresh and mutation state for REFRESH-GENERATION when current."
+(defun majjic--finish-refresh (refresh-generation succeeded)
+  "Clear async refresh and mutation state for REFRESH-GENERATION when current.
+When SUCCEEDED is non-nil, show the refresh completion message."
   (when (and (= refresh-generation majjic--process-generation)
              (not (majjic--operation-process-live-p majjic--refresh-process)))
     (setq majjic--mutation-in-progress nil)
     (setq majjic--mutation-process nil)
-    (majjic--set-operation-status nil)))
+    (majjic--set-operation-status nil)
+    (when (and succeeded
+               (equal (car-safe majjic--refresh-completion-message)
+                      refresh-generation))
+      (message "%s" (cdr majjic--refresh-completion-message)))
+    (when (equal (car-safe majjic--refresh-completion-message)
+                 refresh-generation)
+      (setq majjic--refresh-completion-message nil))))
 
 (defun majjic--log-refresh-sync (state)
   "Synchronously snapshot and refresh, preserving UI STATE."

@@ -507,6 +507,7 @@
           (majjic--marked-change-ids '("marked-change"))
           (majjic-rebase-mode nil)
           target-spec
+          success-message
           ran)
       (cl-letf (((symbol-function 'majjic--change-id-for-commit-id)
                  (lambda (commit-id)
@@ -528,7 +529,8 @@
                 ((symbol-function 'majjic--run-mutation)
                  (lambda (command &rest plist)
                    (setq ran (funcall command))
-                   (setq target-spec (plist-get plist :target)))))
+                   (setq target-spec (plist-get plist :target))
+                   (setq success-message (plist-get plist :success-message)))))
         (let ((inhibit-read-only t))
           (majjic--render-records
            (list (make-majjic-revision
@@ -540,6 +542,7 @@
            (make-majjic-state)))
         (majjic-describe)
         (should (equal ran '("describe" "-r" "commit-1" "-m" "new description")))
+        (should (equal success-message "Updated description"))
         (should (equal (funcall target-spec) "rewritten-commit"))))))
 
 (ert-deftest majjic-test-describe-rejects-unavailable-states ()
@@ -686,6 +689,7 @@
     (let ((majjic--repo-root "/tmp/majjic-test")
           target-spec
           after-success
+          success-message
           ran)
       (let ((inhibit-read-only t))
         (majjic--render-records
@@ -740,10 +744,12 @@
                  (lambda (command &rest plist)
                    (setq ran (funcall command))
                    (setq target-spec (plist-get plist :target))
-                   (setq after-success (plist-get plist :after-success)))))
+                   (setq after-success (plist-get plist :after-success))
+                   (setq success-message (plist-get plist :success-message)))))
         (majjic-squash-apply)
         (should (equal ran '("squash" "--from" "source-1" "--from" "source-2"
                              "--into" "commit-3" "--use-destination-message")))
+        (should (equal success-message "Squashed 2 revisions"))
         (funcall after-success)
         (should-not majjic-squash-mode)
         (should (equal (funcall target-spec) "rewritten-dest"))))))
@@ -864,7 +870,8 @@
                                      :refresh nil)))
           preview-args
           ran
-          mutation-refresh)
+          mutation-refresh
+          mutation-success-message)
       (cl-letf* (((symbol-function 'majjic--marked-visible-commit-ids)
                   (lambda () '("c1" "c2")))
                  ((symbol-function 'majjic--custom-command-preview-result-async)
@@ -892,11 +899,13 @@
                  ((symbol-function 'majjic--run-mutation)
                   (lambda (command &rest plist)
                     (setq ran (funcall command))
-                    (setq mutation-refresh (plist-get plist :refresh)))))
+                    (setq mutation-refresh (plist-get plist :refresh))
+                    (setq mutation-success-message (plist-get plist :success-message)))))
         (majjic-run-custom-command "Graphite submit")
         (should (equal preview-args '("gt-submit" "--dry-run" "-r" "c1 | c2")))
         (should (equal ran '("gt-submit" "-r" "c1 | c2")))
-        (should-not mutation-refresh)))))
+        (should-not mutation-refresh)
+        (should (equal mutation-success-message "Graphite submit finished"))))))
 
 (ert-deftest majjic-test-custom-command-preview-failure-and-blocking ()
   "Custom command preview failures should not mutate and previews should block."
@@ -977,10 +986,12 @@
                  ((symbol-function 'majjic--confirm-preview)
                   (lambda (_action _preview _prompt) t))
                  ((symbol-function 'majjic--run-mutation)
-                  (lambda (command &rest _args)
+                  (lambda (command &rest plist)
                     (setq ran t)
                     (should (equal (funcall command)
-                                   '("git" "push" "--change" "current"))))))
+                                   '("git" "push" "--change" "current")))
+                    (should (equal (plist-get plist :success-message)
+                                   "Pushed selected changes")))))
         (majjic-git-push-change)
         (should (equal previewed '("current")))
         (should (equal preview-args
@@ -1001,10 +1012,12 @@
                  ((symbol-function 'majjic--confirm-preview)
                   (lambda (_action _preview _prompt) t))
                  ((symbol-function 'majjic--run-mutation)
-                  (lambda (command &rest _args)
+                  (lambda (command &rest plist)
                     (setq ran t)
                     (should (equal (funcall command)
-                                   '("git" "push" "--revision" "current"))))))
+                                   '("git" "push" "--revision" "current")))
+                    (should (equal (plist-get plist :success-message)
+                                   "Pushed selected revisions")))))
         (majjic-git-push)
         (should (equal previewed '("current")))
         (should (equal preview-args
@@ -1056,18 +1069,22 @@
           (majjic-rebase-mode nil)
           (ran nil))
       (cl-letf (((symbol-function 'majjic--run-mutation)
-                 (lambda (command &rest _args)
+                 (lambda (command &rest plist)
                    (setq ran t)
-                   (should (equal (funcall command) '("git" "fetch"))))))
+                   (should (equal (funcall command) '("git" "fetch")))
+                   (should (equal (plist-get plist :success-message)
+                                  "Fetched from Git remote")))))
         (majjic-git-fetch)
         (should ran)))
     (let ((majjic--repo-root "/tmp/majjic-test")
           (majjic-rebase-mode nil)
           (ran nil))
       (cl-letf (((symbol-function 'majjic--run-mutation)
-                 (lambda (command &rest _args)
+                 (lambda (command &rest plist)
                    (setq ran t)
-                   (should (equal (funcall command) '("git" "fetch" "--tracked"))))))
+                   (should (equal (funcall command) '("git" "fetch" "--tracked")))
+                   (should (equal (plist-get plist :success-message)
+                                  "Fetched tracked bookmarks from Git remote")))))
         (majjic-git-fetch-tracked)
         (should ran)))
     (let ((majjic-rebase-mode t))
@@ -1258,6 +1275,41 @@
         (setq majjic--mutation-process nil)
         (setq majjic--mutation-in-progress nil)
         (majjic--set-operation-status nil)))))
+
+(ert-deftest majjic-test-async-mutation-routes-success-message-through-refresh ()
+  "Successful mutations should surface their completion text after refresh."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((majjic--repo-root "/tmp/majjic-test")
+          mutation-callback
+          refresh-success-message)
+      (cl-letf (((symbol-function 'majjic--call-jj-capture-async)
+                 (lambda (_dir callback &rest _args)
+                   (setq mutation-callback callback)
+                   'mutation-process))
+                ((symbol-function 'majjic--log-refresh-async)
+                 (lambda (_state _generation success-message)
+                   (setq refresh-success-message success-message))))
+        (majjic--run-mutation '("describe") :success-message "Updated description")
+        (funcall mutation-callback 0 "" "")
+        (should (equal refresh-success-message "Updated description"))))))
+
+(ert-deftest majjic-test-refresh-completion-message-only-shows-after-success ()
+  "Refresh completion text should appear only after a successful refresh."
+  (with-temp-buffer
+    (majjic-log-mode)
+    (let ((messages nil)
+          (majjic--process-generation 1)
+          (majjic--refresh-completion-message '(1 . "Refreshed")))
+      (cl-letf (((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (push (apply #'format format-string args) messages))))
+        (majjic--finish-refresh 1 nil)
+        (should-not messages)
+        (setq majjic--process-generation 2)
+        (setq majjic--refresh-completion-message '(2 . "Refreshed"))
+        (majjic--finish-refresh 2 t)
+        (should (equal messages '("Refreshed")))))))
 
 (ert-deftest majjic-test-async-summary-expansion-loads-file-rows ()
   "Lazy summary expansion should populate file rows asynchronously."
@@ -1612,7 +1664,7 @@
                          'mutation-process)
                      'summary-process)))
                 ((symbol-function 'majjic--log-refresh-async)
-                 (lambda (state &optional _generation)
+                 (lambda (state &optional _generation _completion-message)
                    (setq refresh-state state))))
         (let ((inhibit-read-only t))
           (majjic--render-records

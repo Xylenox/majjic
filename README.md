@@ -48,6 +48,7 @@ the current revision when nothing is marked:
          :preview ("gt-submit" "--dry-run" "-r" :revset)
          :confirm "Submit selected revision with Graphite? "
          :status "Submitting selected revision..."
+         :success "Submitted selected revision"
          :refresh t)))
 ```
 

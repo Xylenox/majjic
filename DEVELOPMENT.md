@@ -34,7 +34,7 @@ Minimal Emacs UI for browsing `jj log`.
 
 Custom commands are configured with `majjic-custom-commands`.  Each command is a
 plist with a unique `:name`, a required `:command` argv template, and optional
-`:preview`, `:confirm`, `:status`, and `:refresh` entries.  Templates support
+`:preview`, `:confirm`, `:status`, `:success`, and `:refresh` entries.  Templates support
 `:revset` for the selected visible revisions as one revset argument and
 `(:revisions PREFIX)` for repeated revision arguments.
 
@@ -45,6 +45,7 @@ plist with a unique `:name`, a required `:command` argv template, and optional
          :preview ("gt-submit" "--dry-run" "-r" :revset)
          :confirm "Submit selected revision with Graphite? "
          :status "Submitting selected revision..."
+         :success "Submitted selected revision"
          :refresh t)))
 ```
 
